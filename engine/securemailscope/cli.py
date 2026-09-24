@@ -12,14 +12,9 @@ Exactly three commands, and each maps to something the backend does:
     python -m securemailscope.cli render - --html -           report  -> HTML
     python -m securemailscope.ml.train                        build the model
 
-There used to be a human-facing side to this — a formatted summary, a rule
-lister, ``--fail-on-critical``, flags to write files. All of it duplicated what
-the dashboard already shows, in a second presentation layer that had to be kept
-in step with the first. Two interfaces to one product is one too many.
-
-One document on stdout. Diagnostics on stderr, so stdout stays machine-clean.
+Security (Phase 1): structured errors are emitted for rejections instead of
+raising exceptions that would produce a stack trace on stdout.
 """
-
 from __future__ import annotations
 
 import argparse
@@ -28,8 +23,16 @@ import os
 import sys
 from typing import Optional
 
+from .analysis_result import AnalysisError
 from .pipeline import analyse_capture
 from .report import html_report, json_report
+
+
+def _emit_error(err: AnalysisError) -> int:
+    """Write a structured error document to stdout and return a non-zero exit code."""
+    json.dump(err.to_dict(), sys.stdout, indent=2)
+    sys.stdout.write("\n")
+    return 2
 
 
 def cmd_analyse(args: argparse.Namespace) -> int:
@@ -38,13 +41,29 @@ def cmd_analyse(args: argparse.Namespace) -> int:
         limit = int(os.environ.get('SMS_MAX_MEMORY_MB', '4096')) * 1024 * 1024
         resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
     if not os.path.exists(args.pcap):
-        print(f"error: no such file: {args.pcap}", file=sys.stderr)
-        return 2
+        err = AnalysisError(
+            status="failed",
+            reason="invalid_capture",
+            message=f"no such file: {args.pcap}",
+            limits={"max_input_bytes": 0, "max_decompressed_bytes": 0, "max_packet_count": 0},
+        )
+        return _emit_error(err)
 
     history = json.loads(_read_text(args.history)) if args.history else []
     def progress(stage):
         print("SMS_PROGRESS:" + stage, file=sys.stderr, flush=True)
-    report = analyse_capture(args.pcap, run_ml=not args.no_ml, model_path=args.model, progress=progress, history=history)
+    try:
+        report = analyse_capture(args.pcap, run_ml=not args.no_ml, model_path=args.model, progress=progress, history=history)
+    except AnalysisError as exc:
+        return _emit_error(exc)
+    except Exception as exc:
+        err = AnalysisError(
+            status="failed",
+            reason="internal_error",
+            message=str(exc)[:500],
+            limits={"max_input_bytes": 0, "max_decompressed_bytes": 0, "max_packet_count": 0},
+        )
+        return _emit_error(err)
     payload = json_report.dumps(report, indent=None if args.compact else 2)
 
     if args.json == "-":
@@ -58,14 +77,6 @@ def cmd_analyse(args: argparse.Namespace) -> int:
 
 
 def cmd_render(args: argparse.Namespace) -> int:
-    """
-    Re-render a stored report.
-
-    This exists so the API can hand back the report without the original
-    capture: the analysis is the artefact of record, and re-running it later
-    could produce a different document from a different engine version. It also
-    means a report can be re-rendered from an archived JSON alone.
-    """
     raw = sys.stdin.read() if args.report == "-" else _read_text(args.report)
     try:
         document = json.loads(raw)
@@ -73,6 +84,11 @@ def cmd_render(args: argparse.Namespace) -> int:
         print(f"not a JSON report: {exc}", file=sys.stderr)
         return 2
     if not isinstance(document, dict) or "sessions" not in document:
+        if isinstance(document, dict) and "status" in document:
+            # Pass through structured errors from the analyse step.
+            json.dump(document, sys.stdout, indent=2)
+            sys.stdout.write("\n")
+            return 2
         print("not a SecureMailScope report: no 'sessions' key", file=sys.stderr)
         return 2
 
@@ -126,6 +142,7 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--compact", action="store_true", help="minified JSON")
     a.add_argument("--no-ml", action="store_true", help="skip the model stage")
     a.add_argument("--model", metavar="PATH", help="path to a model bundle")
+    a.add_argument("--history", help="JSON array of earlier investigation reports")
     a.set_defaults(func=cmd_analyse)
 
     d = sub.add_parser(
@@ -136,8 +153,6 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--html", metavar="PATH", default="-",
                    help="where to write the HTML; '-' (the default) is stdout")
     d.set_defaults(func=cmd_render)
-
-    a.add_argument("--history", help="JSON array of earlier investigation reports")
 
     t = sub.add_parser("train", help="train the posture model")
     t.add_argument("--profiles", type=int, default=260)
@@ -154,5 +169,5 @@ def main(argv: Optional[list[str]] = None) -> int:
     return args.func(args)
 
 
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":
     sys.exit(main())

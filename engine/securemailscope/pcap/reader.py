@@ -1,21 +1,18 @@
 """
-PCAP and PCAPNG file readers.
+PCAP and PCAPNG file readers — security-hardened.
 
 Both classic libpcap and the pcapng block format are implemented directly so
 the engine has no native dependency and full control over timestamp
 resolution — which matters more than it sounds.
 
-Timestamp handling
-------------------
-pcapng stores per-interface resolution in the ``if_tsresol`` option; a reader
-that assumes microseconds silently produces wrong times on nanosecond captures.
-Worse, real captures contain individual corrupt timestamps: both pcapng files
-in this project's demo set carry a frame dated 2063.  Because certificate
-validity is judged against the capture clock (see the README), a single
-bad timestamp could invalidate an entire analysis.  ``CaptureReader`` therefore
-reports a *median* packet time alongside first/last, and flags outliers.
+Security changes (Phase 1):
+- gzip decompression is bounded: a configurable max decompressed size prevents
+  a compressed file from expanding until it exhausts memory.
+- file size and packet count are checked before and during parsing so a
+  malformed or malicious capture cannot consume unbounded resources.
+- a structured AnalysisError (analysis_result.py) is raised on rejection so
+  the subprocess layer returns a clean machine-readable error to the API.
 """
-
 from __future__ import annotations
 
 import gzip
@@ -26,6 +23,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import BinaryIO, Iterator, Optional
 
+from ..analysis_result import (
+    AnalysisError,
+    AnalysisLimits,
+    AnalysisStatus,
+    RejectionReason,
+)
+from .. import config as _cfg
 from .layers import (
     ETH_P_IP,
     TcpSegment,
@@ -58,6 +62,10 @@ class CaptureFormatError(ValueError):
     """Raised when a file is not a recognisable packet capture."""
 
 
+class CaptureSecurityError(ValueError):
+    """Raised when a capture violates configured size / decompression limits."""
+
+
 @dataclass
 class RawPacket:
     number: int                 # 1-based frame number, as Wireshark shows it
@@ -84,19 +92,103 @@ class CaptureMeta:
     suspect_timestamps: int = 0
 
 
+def _limits() -> AnalysisLimits:
+    return AnalysisLimits(
+        max_input_bytes=_cfg.MAX_CAPTURE_BYTES,
+        max_decompressed_bytes=_cfg.MAX_DECOMPRESSED_BYTES,
+        max_packet_count=_cfg.MAX_PACKET_COUNT,
+    )
+
+
+def _check_file_size(path: str) -> int:
+    """Return the raw file size, raising CaptureSecurityError if it exceeds the limit."""
+    size = 0
+    try:
+        size = io.open(path, "rb").seek(0, 2)
+    except OSError:
+        return 0
+    if size > _cfg.MAX_CAPTURE_BYTES:
+        raise CaptureSecurityError(
+            AnalysisError(
+                status=AnalysisStatus.REJECTED,
+                reason=RejectionReason.SIZE_LIMIT_EXCEEDED,
+                message=f"capture file is {size / (1024*1024):.1f} MB, "
+                        f"exceeds the {_cfg.MAX_CAPTURE_BYTES // (1024*1024)} MB limit",
+                limits=_limits(),
+            )
+        )
+    return size
+
+
+class _BoundedGzipReader:
+    """
+    A gzip decompressor that refuses to expand beyond MAX_DECOMPRESSED_BYTES.
+    """
+
+    def __init__(self, path: str, max_bytes: Optional[int] = None):
+        self._raw = open(path, "rb")
+        self._decoder = gzip.GzipFile(fileobj=self._raw)
+        self._max = max_bytes if max_bytes is not None else _cfg.MAX_DECOMPRESSED_BYTES
+        self._total = 0
+        self._buf = bytearray()
+
+    def read(self) -> bytes:
+        """Read the entire (bounded) decompressed content."""
+        while True:
+            chunk = self._decoder.read(64 * 1024)
+            if not chunk:
+                break
+            self._total += len(chunk)
+            if self._total > self._max:
+                raise CaptureSecurityError(
+                    AnalysisError(
+                        status=AnalysisStatus.REJECTED,
+                        reason=RejectionReason.DECOMPRESSED_SIZE_LIMIT_EXCEEDED,
+                        message=f"decompressed size exceeds the "
+                                f"{self._max // (1024*1024)} MB limit",
+                        limits=_limits(),
+                    )
+                )
+            self._buf.extend(chunk)
+        return bytes(self._buf)
+
+    def close(self) -> None:
+        try:
+            self._raw.close()
+        except OSError:
+            pass
+
+    def __enter__(self) -> "_BoundedGzipReader":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+
 def _open_maybe_gzip(path: str) -> tuple[BinaryIO, str]:
-    """Transparently handle .gz captures; returns (stream, format_suffix)."""
+    """
+    Transparently handle .gz captures with bounded decompression.
+
+    Returns (stream, format_suffix).  The stream is always seekable enough
+    for the pcap parsers that follow.
+    """
     with open(path, "rb") as probe:
         head = probe.read(2)
     if head == b"\x1f\x8b":
-        raw = gzip.open(path, "rb").read()
+        bounded = _BoundedGzipReader(path)
+        try:
+            raw = bounded.read()
+            bounded.close()
+        except CaptureSecurityError:
+            bounded.close()
+            raise
         return io.BytesIO(raw), ".gz"
     return open(path, "rb"), ""
 
 
-# --------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # classic pcap
-# --------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 class PcapReader:
     def __init__(self, stream: BinaryIO):
@@ -104,17 +196,14 @@ class PcapReader:
         header = stream.read(24)
         if len(header) < 24:
             raise CaptureFormatError("file too short for a pcap global header")
-        # The magic is the value 0xa1b2c3d4 written in the *writer's* byte order.
-        # Reading it little-endian therefore tells us both the order and whether
-        # timestamps are micro- or nanosecond.
         raw = struct.unpack("<I", header[:4])[0]
-        if raw == PCAP_MAGIC_BE:            # bytes d4 c3 b2 a1 -> little-endian file
+        if raw == PCAP_MAGIC_BE:
             self.endian, self.ts_divisor = "<", 1e6
-        elif raw == PCAP_MAGIC_NS_BE:       # bytes 4d 3c b2 a1 -> little-endian, ns
+        elif raw == PCAP_MAGIC_NS_BE:
             self.endian, self.ts_divisor = "<", 1e9
-        elif raw == PCAP_MAGIC_LE:          # bytes a1 b2 c3 d4 -> big-endian file
+        elif raw == PCAP_MAGIC_LE:
             self.endian, self.ts_divisor = ">", 1e6
-        elif raw == PCAP_MAGIC_NS_LE:       # bytes a1 b2 3c 4d -> big-endian, ns
+        elif raw == PCAP_MAGIC_NS_LE:
             self.endian, self.ts_divisor = ">", 1e9
         else:
             raise CaptureFormatError(f"unrecognised pcap magic 0x{raw:08x}")
@@ -136,6 +225,15 @@ class PcapReader:
             if len(data) < incl:
                 return
             n += 1
+            if n > _cfg.MAX_PACKET_COUNT:
+                raise CaptureSecurityError(
+                    AnalysisError(
+                        status=AnalysisStatus.REJECTED,
+                        reason=RejectionReason.PACKET_COUNT_EXCEEDED,
+                        message=f"packet count exceeds the {_cfg.MAX_PACKET_COUNT} limit",
+                        limits=_limits(),
+                    )
+                )
             yield RawPacket(
                 number=n,
                 timestamp=ts_sec + ts_frac / self.ts_divisor,
@@ -146,15 +244,14 @@ class PcapReader:
             )
 
 
-# --------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # pcapng
-# --------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 class PcapNgReader:
     def __init__(self, stream: BinaryIO):
         self.stream = stream
         self.endian = "<"
-        # per-interface: (dlt, timestamp divisor)
         self.interfaces: list[tuple[int, float]] = []
         self._peek_shb()
 
@@ -171,21 +268,15 @@ class PcapNgReader:
 
     @staticmethod
     def _tsresol_from_options(body: bytes, endian: str, opt_offset: int) -> float:
-        """
-        Parse IDB options to find if_tsresol (code 9).
-
-        Value is one byte: if the high bit is set the resolution is 2^-(v & 0x7f),
-        otherwise 10^-v.  Default when absent is microseconds (10^-6).
-        """
         off = opt_offset
         while off + 4 <= len(body):
             code, length = struct.unpack(endian + "HH", body[off:off + 4])
             off += 4
-            if code == 0:  # opt_endofopt
+            if code == 0:
                 break
             val = body[off:off + length]
             off += length
-            off += (-length) % 4  # options are padded to 32-bit boundaries
+            off += (-length) % 4
             if code == 9 and len(val) >= 1:
                 v = val[0]
                 if v & 0x80:
@@ -209,7 +300,6 @@ class PcapNgReader:
             self.stream.read(4)  # trailing block_total_length
 
             if btype == BT_SHB:
-                # A new section resets the interface table.
                 self.interfaces = []
             elif btype == BT_IDB:
                 if len(body) >= 8:
@@ -224,6 +314,15 @@ class PcapNgReader:
                 ts = ((ts_hi << 32) | ts_lo) / divisor
                 data = body[20:20 + cap_len]
                 n += 1
+                if n > _cfg.MAX_PACKET_COUNT:
+                    raise CaptureSecurityError(
+                        AnalysisError(
+                            status=AnalysisStatus.REJECTED,
+                            reason=RejectionReason.PACKET_COUNT_EXCEEDED,
+                            message=f"packet count exceeds the {_cfg.MAX_PACKET_COUNT} limit",
+                            limits=_limits(),
+                        )
+                    )
                 yield RawPacket(n, ts, data, dlt, cap_len, orig_len)
             elif btype == BT_SPB:
                 if len(body) < 4:
@@ -232,6 +331,15 @@ class PcapNgReader:
                 dlt, _ = self.interfaces[0] if self.interfaces else (1, 1e6)
                 data = body[4:]
                 n += 1
+                if n > _cfg.MAX_PACKET_COUNT:
+                    raise CaptureSecurityError(
+                        AnalysisError(
+                            status=AnalysisStatus.REJECTED,
+                            reason=RejectionReason.PACKET_COUNT_EXCEEDED,
+                            message=f"packet count exceeds the {_cfg.MAX_PACKET_COUNT} limit",
+                            limits=_limits(),
+                        )
+                    )
                 yield RawPacket(n, 0.0, data, dlt, len(data), orig_len)
             elif btype == BT_PB:
                 if len(body) < 20:
@@ -242,13 +350,21 @@ class PcapNgReader:
                 ts = ((ts_hi << 32) | ts_lo) / divisor
                 data = body[20:20 + cap_len]
                 n += 1
+                if n > _cfg.MAX_PACKET_COUNT:
+                    raise CaptureSecurityError(
+                        AnalysisError(
+                            status=AnalysisStatus.REJECTED,
+                            reason=RejectionReason.PACKET_COUNT_EXCEEDED,
+                            message=f"packet count exceeds the {_cfg.MAX_PACKET_COUNT} limit",
+                            limits=_limits(),
+                        )
+                    )
                 yield RawPacket(n, ts, data, dlt, cap_len, orig_len)
-            # all other block types are skipped
 
 
-# --------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # unified entry point
-# --------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 class CaptureReader:
     """
@@ -260,7 +376,22 @@ class CaptureReader:
         self.path = path
         self.meta = CaptureMeta()
         self._packets: list[RawPacket] = []
-        self._load()
+        _check_file_size(path)
+        try:
+            self._load()
+        except CaptureSecurityError:
+            raise
+        except CaptureFormatError:
+            raise
+        except MemoryError:
+            raise CaptureSecurityError(
+                AnalysisError(
+                    status=AnalysisStatus.REJECTED,
+                    reason=RejectionReason.SIZE_LIMIT_EXCEEDED,
+                    message="capture exceeded available memory during parsing",
+                    limits=_limits(),
+                )
+            )
 
     def _load(self) -> None:
         stream, gz = _open_maybe_gzip(self.path)
@@ -276,10 +407,12 @@ class CaptureReader:
                 reader = PcapReader(stream)
                 self.meta.format = "pcap" + gz
             self._packets = list(reader.packets())
+        except (struct.error, EOFError) as exc:
+            raise CaptureFormatError(f"malformed capture data: {exc}")
         finally:
             try:
                 stream.close()
-            except Exception:  # pragma: no cover - defensive
+            except Exception:
                 pass
 
         self.meta.packet_count = len(self._packets)
@@ -307,7 +440,6 @@ class CaptureReader:
         return abs(ts - self.meta.median_time) > TIMESTAMP_OUTLIER_SECONDS
 
     def sane_time(self, ts: float) -> float:
-        """Return ts, or the capture median if ts is an outlier."""
         if self.is_suspect_time(ts):
             return self.meta.median_time or ts
         return ts

@@ -6,15 +6,51 @@ fields it owns:
 
     ingest -> parse -> reassemble -> classify -> analyse -> features
            -> rules -> grade -> ml -> aggregate -> report
-"""
 
+Phase 1 additions:
+- structured CaptureCompleteness assessment is computed and attached
+- EvidenceBundle is built for every session so findings can cite evidence
+- CaptureSecurityError from the reader propagates as a structured AnalysisError
+"""
 from __future__ import annotations
 
 import hashlib
 import os
 from datetime import datetime, timezone
-from typing import Optional, Callable
+from typing import Any, Callable, Optional
+
+from .analysis_result import (
+    AnalysisError,
+    AnalysisLimits,
+    AnalysisStatus,
+    RejectionReason,
+)
 from .assessment import coverage, provenance
+from .capture_completeness import (
+    CaptureCompleteness,
+    CaptureQuality,
+    EmailSessionStats,
+    Limitation,
+    MissingEvidence,
+    TCPFlowStats,
+    TLSSessionStats,
+)
+from .config import MAX_CAPTURE_BYTES, MAX_DECOMPRESSED_BYTES, MAX_PACKET_COUNT
+from .evidence import (
+    CertificateObservation,
+    CertificateObservationType,
+    Confidence as EvidenceConfidence,
+    DNSObservation,
+    DNSObservationType,
+    EvidenceBundle,
+    ObservationStatus,
+    PacketRef,
+    ProtocolObservation,
+    ProtocolObservationType,
+    TLSObservation,
+    TLSObservationType,
+    CaptureEvidence,
+)
 from .history import annotate_history
 
 from .analyze import certs as certmod
@@ -34,7 +70,12 @@ from .models import (
     TlsMode,
 )
 from .net.reassembly import TcpStream, reassemble
-from .pcap.reader import CaptureReader, epoch_to_datetime
+from .pcap.reader import (
+    CaptureFormatError,
+    CaptureReader,
+    CaptureSecurityError,
+    epoch_to_datetime,
+)
 from .scoring.aggregate import build_assets, overall, remediation_plan
 from .scoring.grade import grade_session
 from .scoring.rules import apply_rules
@@ -51,6 +92,157 @@ def file_sha256(path: str, chunk: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
+def _limits() -> AnalysisLimits:
+    return AnalysisLimits(
+        max_input_bytes=MAX_CAPTURE_BYTES,
+        max_decompressed_bytes=MAX_DECOMPRESSED_BYTES,
+        max_packet_count=MAX_PACKET_COUNT,
+    )
+
+
+def _assess_capture_completeness(
+    reader: CaptureReader,
+    sessions: list[Session],
+    streams: list[TcpStream],
+    dns_query_count: int,
+) -> CaptureCompleteness:
+    """
+    Build a first-class CaptureCompleteness from what we observed.
+    """
+    meta = reader.meta
+
+    # --- TCP flow stats --------------------------------------------------
+    tcp = TCPFlowStats()
+    tcp.total = len(streams)
+    for st in streams:
+        if st.saw_syn:
+            tcp.complete_syn_ack += 1
+        if st.saw_fin:
+            tcp.with_fin += 1
+        if st.saw_rst:
+            tcp.with_rst += 1
+        gaps_c = len(st.client_to_server.gaps)
+        gaps_s = len(st.server_to_client.gaps)
+        if gaps_c == 0 and gaps_s == 0:
+            tcp.reassembled_without_gaps += 1
+        else:
+            tcp.with_reassembly_gaps += 1
+    tcp.truncated_packets = meta.truncated_packets
+
+    # --- email session stats ---------------------------------------------
+    email = EmailSessionStats()
+    email.total = len(sessions)
+    for s in sessions:
+        if s.tls_mode == TlsMode.CLEARTEXT:
+            email.plaintext_only += 1
+        if s.starttls_accepted:
+            email.starttls_negotiated += 1
+        elif s.starttls_offered:
+            email.starttls_offered_not_used += 1
+        else:
+            email.starttls_not_offered += 1
+        if s.cleartext_auth is not None:
+            email.auth_before_tls += 1
+        if s.command_transcript and s.tls_mode != TlsMode.UNKNOWN:
+            email.with_complete_conversation += 1
+        else:
+            email.with_incomplete_conversation += 1
+
+    # --- TLS session stats -----------------------------------------------
+    tls_stats = TLSSessionStats()
+    for s in sessions:
+        if s.tls_version is not None:
+            tls_stats.total += 1
+            if s.handshake_complete:
+                tls_stats.handshake_complete += 1
+            else:
+                tls_stats.handshake_incomplete += 1
+            if s.cert_visibility == CertVisibility.OBSERVED:
+                tls_stats.certificate_observed += 1
+            elif s.cert_visibility == CertVisibility.ENCRYPTED_TLS13:
+                tls_stats.certificate_encrypted_tls13 += 1
+            else:
+                tls_stats.certificate_missing += 1
+
+    # --- missing evidence -----------------------------------------------
+    missing: list[MissingEvidence] = []
+    limitations: list[Limitation] = []
+
+    if meta.truncated_packets > 0:
+        missing.append(MissingEvidence(
+            check="truncated_packets",
+            what_is_missing=f"{meta.truncated_packets} packet(s) were truncated by the capture snaplen",
+            why_it_matters="truncated packets may hide protocol commands or TLS handshake messages",
+            findings_affected=["protocol-detection", "tls-handshake"],
+        ))
+
+    if meta.suspect_timestamps > 0:
+        missing.append(MissingEvidence(
+            check="suspect_timestamps",
+            what_is_missing=f"{meta.suspect_timestamps} packet(s) carry a timestamp far outside the capture range",
+            why_it_matters="certificate validity is judged against the capture clock",
+            findings_affected=["certificate-validity"],
+        ))
+
+    if tcp.with_reassembly_gaps > 0:
+        missing.append(MissingEvidence(
+            check="tcp_gaps",
+            what_is_missing=f"{tcp.with_reassembly_gaps} TCP stream(s) have reassembly gaps",
+            why_it_matters="missing bytes may hide protocol commands or credentials",
+            findings_affected=["protocol-commands", "credential-exposure"],
+        ))
+
+    if tls_stats.handshake_incomplete > 0:
+        missing.append(MissingEvidence(
+            check="incomplete_handshake",
+            what_is_missing=f"{tls_stats.handshake_incomplete} TLS session(s) have an incomplete handshake in the capture",
+            why_it_matters="without the full handshake the negotiated parameters may be unknown",
+            findings_affected=["tls-version", "cipher-suite"],
+        ))
+
+    if tls_stats.certificate_encrypted_tls13 > 0:
+        limitations.append(Limitation(
+            check="tls13_cert_encrypted",
+            description=f"{tls_stats.certificate_encrypted_tls13} TLS 1.3 session(s) have encrypted certificates (per RFC 8446)",
+            affects=["certificate-validity", "hostname-match"],
+        ))
+
+    # --- score -----------------------------------------------------------
+    score = 100
+    if meta.truncated_packets > 0:
+        score -= min(20, meta.truncated_packets * 2)
+    if meta.suspect_timestamps > 0:
+        score -= min(10, meta.suspect_timestamps)
+    if tcp.with_reassembly_gaps > 0:
+        score -= min(20, tcp.with_reassembly_gaps * 5)
+    if tls_stats.handshake_incomplete > 0:
+        score -= min(15, tls_stats.handshake_incomplete * 5)
+    if email.with_incomplete_conversation > 0:
+        score -= min(15, email.with_incomplete_conversation * 3)
+    score = max(0, min(100, score))
+
+    if score >= 80:
+        status = CaptureQuality.GOOD
+    elif score >= 50:
+        status = CaptureQuality.LIMITED
+    else:
+        status = CaptureQuality.INSUFFICIENT
+
+    return CaptureCompleteness(
+        status=status,
+        score=score,
+        packet_count=meta.packet_count,
+        flow_count=len(streams),
+        tcp=tcp,
+        email=email,
+        tls=tls_stats,
+        dns_queries_seen=dns_query_count,
+        truncated_packets=meta.truncated_packets,
+        missing_evidence=missing,
+        limitations=limitations,
+    )
+
+
 def analyse_capture(
     path: str,
     run_ml: bool = True,
@@ -60,7 +252,19 @@ def analyse_capture(
 ) -> Report:
     emit = progress or (lambda stage: None)
     emit("READING")
-    reader = CaptureReader(path)
+
+    try:
+        reader = CaptureReader(path)
+    except CaptureSecurityError as exc:
+        raise exc
+    except CaptureFormatError as exc:
+        raise AnalysisError(
+            status=AnalysisStatus.REJECTED,
+            reason=RejectionReason.INVALID_CAPTURE,
+            message=str(exc),
+            limits=_limits(),
+        )
+
     meta = reader.meta
 
     capture = CaptureInfo(
@@ -103,18 +307,15 @@ def analyse_capture(
         sessions.append(session)
 
     emit("RULES_AND_COVERAGE")
-    # --- deterministic scoring ------------------------------------------
     for s in sessions:
         s.features = extract_features(s)
         s.findings = apply_rules(s)
         s.grade = grade_session(s, s.findings)
 
-    # --- ML layer (optional, never decides a verdict) --------------------
     emit("ML_ASSESSMENT")
     if run_ml and sessions:
         try:
             from .ml.predict import annotate
-
             annotate(sessions, model_path=model_path)
         except ImportError as exc:
             warnings.append(
@@ -122,7 +323,7 @@ def analyse_capture(
                 f"`pip install 'securemailscope[ml]'`. Every finding and grade above "
                 f"comes from the rule engine and is unaffected."
             )
-        except Exception as exc:  # advisory only; never fail the analysis
+        except Exception as exc:
             warnings.append(f"Model stage skipped — {exc}")
 
     emit("AGGREGATING")
@@ -142,6 +343,9 @@ def analyse_capture(
         "anomalies": sum(1 for s in sessions if s.ml and s.ml.anomaly),
     }
 
+    # --- Phase 1: capture completeness ----------------------------------
+    capture_completeness = _assess_capture_completeness(reader, sessions, streams, policy.queries_seen)
+
     report = Report(
         provenance=provenance(model_path),
         coverage={"sessions": len(sessions), "limited_sessions": sum(s.coverage["label"] == "limited" for s in sessions),
@@ -155,6 +359,8 @@ def analyse_capture(
         counts=counts,
         remediation=remediation_plan(assets),
         warnings=warnings,
+        capture_completeness=capture_completeness,
+        evidence=None,
     )
 
     emit("HISTORY_COMPARISON")
@@ -163,7 +369,6 @@ def analyse_capture(
     report.provenance["ml_applied"] = any(s.ml for s in sessions)
     return report
 
-# --------------------------------------------------------------------------
 
 def _build_session(
     st: TcpStream,
@@ -181,7 +386,6 @@ def _build_session(
     if not is_email_stream(protocol, st):
         return None
 
-    # Cleartext phase is everything before the handshake begins.
     c_clear = c_data[:tls_c] if tls_c is not None else c_data
     s_clear = s_data[:tls_s] if tls_s is not None else s_data
 
@@ -193,8 +397,6 @@ def _build_session(
     mode = classify_mode(st, protocol, tls_c, stls.accepted)
     role = classify_role(protocol, st.server_port)
 
-    # Capture clock, sanitised against the capture median so one corrupt
-    # timestamp cannot invalidate certificate validity for the whole session.
     raw_time = st.first_time
     suspect = reader.is_suspect_time(raw_time)
     capture_time = epoch_to_datetime(reader.sane_time(raw_time))
@@ -251,13 +453,11 @@ def _build_session(
             session.cipher_mode = props.mode
             session.forward_secrecy = props.forward_secrecy
 
-        # Effective key-exchange strength.
         if hs.named_group:
             session.kex_bits = group_strength_bits(hs.named_group) or None
         elif hs.dhe_bits:
             session.kex_bits = hs.dhe_bits
 
-        # ---- certificates ----------------------------------------------
         if hs.certificates:
             session.cert_visibility = CertVisibility.OBSERVED
             analysis = certmod.analyse(
@@ -278,7 +478,6 @@ def _build_session(
             if session.tls_version:
                 session.confidence = Confidence.PARTIAL
 
-    # ---- DNS policy cross-reference ------------------------------------
     mta, tlsa, rpt = policy.policy_for_ip(st.server_ip)
     session.mta_sts_published = mta
     session.tlsa_records = tlsa

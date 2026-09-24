@@ -15,7 +15,6 @@ JSON fixture with no PCAP involved.
 Every observation field is Optional for a reason: passive observation is lossy,
 and a schema that cannot express "we could not see this" forces a lie somewhere.
 """
-
 from __future__ import annotations
 
 import dataclasses
@@ -23,6 +22,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Optional
+
+# These modules have no dependency on models.py — safe to import directly.
+from .capture_completeness import CaptureCompleteness
+from .evidence import CaptureEvidence
 
 SCHEMA_VERSION = "1.0.0"
 
@@ -40,9 +43,9 @@ class Protocol(str, Enum):
 
 class TlsMode(str, Enum):
     """How (or whether) the session became encrypted."""
-    IMPLICIT = "implicit"      # TLS from the first byte (465/993/995)
-    STARTTLS = "starttls"      # cleartext, then an in-band upgrade
-    CLEARTEXT = "cleartext"    # never encrypted
+    IMPLICIT = "implicit"
+    STARTTLS = "starttls"
+    CLEARTEXT = "cleartext"
     UNKNOWN = "unknown"
 
 
@@ -60,9 +63,9 @@ class Role(str, Enum):
 
 
 class CertVisibility(str, Enum):
-    OBSERVED = "observed"                # we parsed real certificate bytes
-    ENCRYPTED_TLS13 = "encrypted_tls13"  # RFC 8446 encrypts the Certificate msg
-    ABSENT = "absent"                    # no TLS, or handshake never completed
+    OBSERVED = "observed"
+    ENCRYPTED_TLS13 = "encrypted_tls13"
+    ABSENT = "absent"
 
 
 class Revocation(str, Enum):
@@ -84,8 +87,8 @@ class Severity(str, Enum):
 
 
 class Confidence(str, Enum):
-    FULL = "full"        # everything the rulebook needs was observable
-    PARTIAL = "partial"  # certificate encrypted / handshake truncated
+    FULL = "full"
+    PARTIAL = "partial"
 
 
 # --------------------------------------------------------------------------
@@ -97,7 +100,7 @@ class Endpoint:
     ip: str
     port: int
 
-    def __str__(self) -> str:  # pragma: no cover - trivial
+    def __str__(self) -> str:
         return f"{self.ip}:{self.port}"
 
 
@@ -212,9 +215,6 @@ class Session:
     server: Endpoint
     first_frame: int = 0
     last_frame: int = 0
-    # The clock certificate validity is judged against.  Taken from this
-    # session's first frame, sanitised against the capture median so a single
-    # corrupt packet timestamp cannot invalidate the analysis.
     capture_time: Optional[datetime] = None
     capture_time_suspect: bool = False
     duration_seconds: float = 0.0
@@ -356,6 +356,10 @@ class Report:
     counts: dict[str, int] = field(default_factory=dict)
     remediation: list[dict[str, Any]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+
+    # Phase 1 additions -----------------------------------------------------
+    capture_completeness: Optional[CaptureCompleteness] = None
+    evidence: Optional[CaptureEvidence] = None
 
 
 # --------------------------------------------------------------------------
