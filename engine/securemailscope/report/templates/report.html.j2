@@ -68,6 +68,20 @@
   .finding .fd{color:var(--ink-2);font-size:14px;margin-top:5px;}
   .finding .fr{font-size:13.5px;margin-top:6px;padding:8px 11px;background:var(--surface-2);
                border-radius:4px;border:1px solid var(--line);}
+  .ev-box{font-family:var(--mono);font-size:11.5px;background:var(--surface-2);border:1px solid var(--line);
+          border-radius:4px;padding:10px 12px;margin-top:6px;white-space:pre-wrap;}
+  .ev-label{font-family:var(--mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase;
+            color:var(--ink-3);margin-bottom:4px;}
+  .state-flow{font-family:var(--mono);font-size:12px;line-height:1.7;background:var(--surface-2);
+              border:1px solid var(--line);border-radius:4px;padding:12px 14px;margin:8px 0;white-space:pre-wrap;}
+  .sec-trans{color:var(--crit);font-weight:600;}
+  .obs-stat{font-family:var(--mono);font-size:10px;letter-spacing:.05em;text-transform:uppercase;
+            padding:2px 6px;border-radius:3px;}
+  .obs-observed{background:var(--ok-soft);color:var(--ok)}
+  .obs-inferred{background:var(--high-soft);color:var(--high)}
+  .obs-not-observable{background:var(--surface-3);color:var(--ink-2)}
+  .obs-contradicted{background:var(--crit-soft);color:var(--crit)}
+  .obs-insufficient{background:var(--med-soft);color:var(--med)}
   pre{font-family:var(--mono);font-size:11.5px;line-height:1.55;background:var(--surface-2);
       border:1px solid var(--line);border-radius:5px;padding:14px 16px;overflow-x:auto;white-space:pre;}
   .note{border:1px solid var(--line);border-left:3px solid var(--high);background:var(--high-soft);
@@ -260,6 +274,40 @@
     <div class="fr"><b>Fix:</b> {{ f.remediation }}</div>
   </div>
   {% endfor %}
+
+  {# Phase 2: Evidence section per session #}
+  {% if r.email_security_state_machines %}
+  {% for sm in r.email_security_state_machines %}
+  {% if sm.session_id == s.session_id %}
+  <h3>Email security state machine</h3>
+  <div class="state-flow">
+{% for st in sm.states %}{{ st.name }}{% if not loop.last %} → {% endif %}{% endfor %}
+  </div>
+  {% if sm.security_relevant_transitions %}
+  <div class="ev-label">Security-relevant transitions</div>
+  {% for tr in sm.security_relevant_transitions %}
+  <div class="finding high">
+    <div class="ft"><span class="pill s-high">security</span> {{ tr.from_state }} → {{ tr.to_state }}</div>
+    {% if tr.details %}<div class="fd">{{ tr.details }}</div>{% endif %}
+    <div class="fm">Frame {{ tr.frame or 'unknown' }} · confidence {{ tr.confidence }} · status <span class="obs-stat obs-{{ tr.status }}">{{ tr.status }}</span></div>
+    {% if tr.observation_refs %}
+    <div class="ev-box">
+{% for ref in tr.observation_refs %}<span class="obs-stat obs-{{ ref.status }}">{{ ref.status }}</span> {{ ref.observation_type }}{% if ref.excerpt %}: {{ ref.excerpt[:100] }}{% endif %}
+{% endfor %}
+    </div>
+    {% endif %}
+  </div>
+  {% endfor %}
+  {% endif %}
+  {% if sm.limitations %}
+  <div class="ev-label">Limitations</div>
+  <ul class="muted">
+    {% for lim in sm.limitations %}<li>{{ lim }}</li>{% endfor %}
+  </ul>
+  {% endif %}
+  {% endif %}
+  {% endfor %}
+  {% endif %}
 
   {% if s.ml %}
   <h3>Model assessment</h3>
