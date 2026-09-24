@@ -79,6 +79,7 @@ from .pcap.reader import (
 from .scoring.aggregate import build_assets, overall, remediation_plan
 from .scoring.grade import grade_session
 from .scoring.rules import apply_rules
+from .smtp_state_machine import build_state_machine_for_session
 
 
 def file_sha256(path: str, chunk: int = 1 << 20) -> str:
@@ -346,6 +347,13 @@ def analyse_capture(
     # --- Phase 1: capture completeness ----------------------------------
     capture_completeness = _assess_capture_completeness(reader, sessions, streams, policy.queries_seen)
 
+    # --- Phase 2: email security state machines ------------------------
+    email_security_state_machines = []
+    for s in sessions:
+        sm_result = build_state_machine_for_session(s)
+        if sm_result is not None:
+            email_security_state_machines.append(sm_result)
+
     report = Report(
         provenance=provenance(model_path),
         coverage={"sessions": len(sessions), "limited_sessions": sum(s.coverage["label"] == "limited" for s in sessions),
@@ -361,6 +369,7 @@ def analyse_capture(
         warnings=warnings,
         capture_completeness=capture_completeness,
         evidence=None,
+        email_security_state_machines=email_security_state_machines or None,
     )
 
     emit("HISTORY_COMPARISON")

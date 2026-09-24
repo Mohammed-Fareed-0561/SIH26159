@@ -361,6 +361,9 @@ class Report:
     capture_completeness: Optional[CaptureCompleteness] = None
     evidence: Optional[CaptureEvidence] = None
 
+    # Phase 2 additions -----------------------------------------------------
+    email_security_state_machines: Optional[list] = None
+
 
 # --------------------------------------------------------------------------
 # serialisation
