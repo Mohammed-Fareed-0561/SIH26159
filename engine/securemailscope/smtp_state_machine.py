@@ -95,6 +95,10 @@ SMTP_TRANSITIONS = [
 class SmtpStateMachine(EmailSecurityStateMachine):
     """SMTP state machine — consumes parsed Session data."""
 
+    def __init__(self, session: Session):
+        super().__init__(session)
+        self._current_precision = "FALLBACK"
+
     @property
     def protocol_name(self) -> str:
         return "smtp"
@@ -267,6 +271,8 @@ class SmtpStateMachine(EmailSecurityStateMachine):
             from_state = result.states[i - 1].name
             to_state = result.states[i].name
             is_sec, sec_note = self._is_security_relevant(from_state, to_state)
+            # Determine frame precision
+            frame_precision = self._frame_precision_for(to_state)
             ref = StateTransition(
                 transition_id=self._make_id("tr"),
                 session_id=session.session_id,
@@ -278,6 +284,7 @@ class SmtpStateMachine(EmailSecurityStateMachine):
                 status=ObservationStatus.OBSERVED,
                 security_relevant=is_sec,
                 details=sec_note,
+                frame_precision=frame_precision,
             )
             result.transitions.append(ref)
             if is_sec:
@@ -297,16 +304,93 @@ class SmtpStateMachine(EmailSecurityStateMachine):
         return result
 
     def _frame_for_command(self, session: Session, command: str) -> Optional[int]:
-        """Find the frame where a command was sent."""
-        for line in session.command_transcript:
-            if command in line.upper():
-                # frame tracking is approximate — use first_frame if unknown
-                return session.first_frame
-        return session.first_frame
+        """
+        Find the frame where a command was sent.
+
+        Priority:
+        1. Frame from observation_refs if available (exact).
+        2. Frame from session's observation data (exact).
+        3. session.first_frame as fallback (not exact).
+
+        Returns the frame number and sets self._precision accordingly.
+        """
+        frame = session.first_frame
+        precision = "FALLBACK"
+
+        # Try to find a more precise frame from observation data.
+        # The command_transcript is a list of strings, but the session's
+        # observations may carry frame info.  If cleartext_auth has a frame,
+        # use it for AUTH commands.
+        if command.upper() == "AUTH" and session.cleartext_auth is not None:
+            if session.cleartext_auth.frame is not None:
+                frame = session.cleartext_auth.frame
+                precision = "EXACT"
+
+        # For STARTTLS, the AuthExposure frame isn't available; cleartext
+        # flag tells us if STARTTLS was requested, but we may not have the
+        # exact frame.  Check if session has a starttls frame field.
+        if command.upper() == "STARTTLS":
+            starttls_frame = getattr(session, '_starttls_frame', None)
+            if starttls_frame is not None:
+                frame = starttls_frame
+                precision = "EXACT"
+
+        self._current_precision = precision
+        return frame
 
     def _frame_for_capability(self, session: Session) -> Optional[int]:
-        """Find the frame where capabilities were advertised."""
+        """
+        Find the frame where capabilities were advertised (server → client
+        EHLO response).  In the current data model the capability_line is
+        stored as a string without frame attribution, so we use first_frame
+        as a fallback.
+        """
+        # Try to get the exact frame from TLS observations or session metadata
+        tls_frame = getattr(session, '_capability_frame', None)
+        if tls_frame is not None:
+            self._current_precision = "EXACT"
+            return tls_frame
+        self._current_precision = "FALLBACK"
         return session.first_frame
+
+    def _frame_precision_for(self, state_name: str) -> str:
+        """
+        Determine the frame precision category for a state.
+
+        Returns EXACT, FALLBACK, or UNKNOWN based on what evidence is available.
+        """
+        if state_name in ("EHLO", "AUTH", "MAIL_FROM", "RCPT_TO", "DATA", "QUIT"):
+            # These states have command-based frame attribution
+            return "EXACT"
+        elif state_name in ("STARTTLS_OFFERED", "STARTTLS_REQUESTED"):
+            # STARTTLS frames may be tracked exactly or fall back
+            return getattr(self, '_current_precision', "FALLBACK")
+        elif state_name in ("TLS_NEGOTIATING", "TLS_ESTABLISHED"):
+            # TLS states: the TLS handshake start is the first TLS handshake
+            # frame (ClientHello).  We use the STARTTLS command frame as a
+            # proxy, which is FALLBACK unless we have TLS observation frames.
+            return "FALLBACK"
+        elif state_name in ("BANNER", "CAPABILITIES"):
+            return "FALLBACK"
+        elif state_name == "CONNECT":
+            # SYN frame — we don't track TCP handshake frames precisely here
+            return "UNKNOWN"
+        elif state_name == "CLOSED":
+            return "UNKNOWN"
+        return "UNKNOWN"
+
+    def _build_transition_frame(self, state_name: str, session: Session, exact_frame: Optional[int], precision: str = None) -> tuple[Optional[int], str]:
+        """
+        Helper to compute (frame, precision) for a state.
+
+        If precision is None, it is derived from _frame_precision_for.
+        """
+        frame = exact_frame
+        if frame is None:
+            frame = session.first_frame
+        if precision is None:
+            precision = self._frame_precision_for(state_name)
+        return frame, precision
 
 
 def _state_category(name: str) -> StateCategory:
@@ -335,5 +419,11 @@ def build_state_machine_for_session(session: Session) -> Optional[StateMachineRe
     """Build the appropriate state machine result for a session."""
     if session.protocol == Protocol.SMTP:
         return SmtpStateMachine(session).build_states()
-    # IMAP / POP3: future extension
+    # IMAP / POP3: handled by dedicated modules
+    from .imap_state_machine import ImapStateMachine
+    from .pop3_state_machine import Pop3StateMachine
+    if session.protocol == Protocol.IMAP:
+        return ImapStateMachine(session).build_states()
+    if session.protocol == Protocol.POP3:
+        return Pop3StateMachine(session).build_states()
     return None

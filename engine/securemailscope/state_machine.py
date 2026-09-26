@@ -77,6 +77,8 @@ class StateTransition:
     status: ObservationStatus = ObservationStatus.OBSERVED
     security_relevant: bool = False
     details: Optional[str] = None
+    # Phase 3: precision of frame attribution (Part 3)
+    frame_precision: str = "UNKNOWN"  # EXACT | FALLBACK | UNKNOWN
 
 
 @dataclass

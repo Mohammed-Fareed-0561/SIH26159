@@ -269,7 +269,7 @@
   {% for f in s.findings %}
   <div class="finding {{ f.severity }}">
     <div class="ft"><span class="pill s-{{ f.severity }}">{{ f.severity }}</span> {{ f.rule_id }} — {{ f.title }}</div>
-    <div class="fm">{{ f.standard }} · frames {{ f.evidence.frames|join(', ') }} · stream {{ f.evidence.tcp_stream }}</div>
+    <div class="fm">{{ f.standard }} · frames {{ f.evidence.frames|join(', ') }} · stream {{ f.evidence.tcp_stream }}{% if f.standards_refs %} · standards {{ f.standards_refs|join(', ') }}{% endif %}</div>
     {% if f.detail %}<div class="fd">{{ f.detail }}</div>{% endif %}
     <div class="fr"><b>Fix:</b> {{ f.remediation }}</div>
   </div>
@@ -289,7 +289,7 @@
   <div class="finding high">
     <div class="ft"><span class="pill s-high">security</span> {{ tr.from_state }} → {{ tr.to_state }}</div>
     {% if tr.details %}<div class="fd">{{ tr.details }}</div>{% endif %}
-    <div class="fm">Frame {{ tr.frame or 'unknown' }} · confidence {{ tr.confidence }} · status <span class="obs-stat obs-{{ tr.status }}">{{ tr.status }}</span></div>
+    <div class="fm">Frame {{ tr.frame or 'unknown' }} · confidence {{ tr.confidence }} · status <span class="obs-stat obs-{{ tr.status }}">{{ tr.status }}</span> · frame precision {{ tr.frame_precision or 'UNKNOWN' }}</div>
     {% if tr.observation_refs %}
     <div class="ev-box">
 {% for ref in tr.observation_refs %}<span class="obs-stat obs-{{ ref.status }}">{{ ref.status }}</span> {{ ref.observation_type }}{% if ref.excerpt %}: {{ ref.excerpt[:100] }}{% endif %}
@@ -306,6 +306,65 @@
   </ul>
   {% endif %}
   {% endif %}
+  {% endfor %}
+  {% endif %}
+  {# Phase 3: Security Controls #}
+  {% if s.security_controls %}
+  <h3>Security controls</h3>
+  <div class="tw"><table>
+    <thead><tr><th>Control</th><th>Status</th><th>Reason</th></tr></thead>
+    <tbody>
+    {% for c in s.security_controls %}
+    <tr>
+      <td class="mono">{{ c.control_id }}</td>
+      <td><span class="pill s-{% if c.status == 'FAIL' %}critical{% elif c.status == 'WARN' %}high{% elif c.status == 'PASS' %}info{% else %}low{% endif %}">{{ c.status }}</span></td>
+      <td>{{ c.reason }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% endif %}
+
+  {# Phase 3: Reasoning #}
+  {% if s.reasoning %}
+  <h3>Security reasoning</h3>
+  {% for r in s.reasoning %}
+  <div class="finding high">
+    <div class="ft"><span class="pill s-high">reasoning</span> {{ r.rule_id }}</div>
+    {% if r.observed_facts %}
+    <div class="ev-label">Observed facts</div>
+    <ul class="muted">
+      {% for f in r.observed_facts %}
+      <li>{{ f.description }} <span class="obs-stat obs-{{ f.status }}">{{ f.status }}</span></li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+    {% if r.inferences %}
+    <div class="ev-label">Inferences</div>
+    <ul class="muted">
+      {% for i in r.inferences %}
+      <li>{{ i.description }} (confidence: {{ i.confidence }})</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+    {% if r.possible_explanations %}
+    <div class="ev-label">Possible explanations</div>
+    <ul class="muted">
+      {% for e in r.possible_explanations %}
+      <li><b>{{ e.explanation_id }}</b> — {{ e.description }}
+        <span class="pill s-{% if e.status == 'likely' %}critical{% elif e.status == 'possible' %}high{% else %}low{% endif %}">{{ e.confidence }}</span>
+        {% if e.supporting_evidence %}<br><span class="mono muted">+ {{ e.supporting_evidence|length }} supporting</span>{% endif %}
+        {% if e.contradicting_evidence %}<br><span class="mono muted">— {{ e.contradicting_evidence|length }} contradicting</span>{% endif %}
+      </li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+    <div class="fm">Overall confidence: {{ r.confidence }} · Risk: {{ r.risk.overall if r.risk else 'unknown' }} (impact {{ r.risk.impact.value if r.risk else '—' }}, exposure {{ r.risk.exposure.value if r.risk else '—' }})</div>
+    {% if r.limitations %}
+    <div class="ev-label">Limitations</div>
+    <ul class="muted">{% for l in r.limitations %}<li>{{ l }}</li>{% endfor %}</ul>
+    {% endif %}
+  </div>
   {% endfor %}
   {% endif %}
 
@@ -343,6 +402,34 @@
   {% if s.notes %}<p class="muted">{% for n in s.notes %}{{ n }} {% endfor %}</p>{% endif %}
 </div>
 {% endfor %}
+
+{# Phase 3: Cross-session patterns #}
+{% if r.cross_session_patterns %}
+<h2>5 · Cross-session patterns</h2>
+<p class="muted">Patterns are signals to review — they do not confirm attacks. Each
+pattern lists confidence and possible interpretations.</p>
+{% for p in r.cross_session_patterns %}
+<div class="card">
+  <b>{{ p.name }}</b> · <span class="pill s-{{ 'high' if p.confidence == 'high' else 'med' if p.confidence == 'medium' else 'low' }}">{{ p.confidence }}</span>
+  <p>{{ p.description }}</p>
+  {% if p.observations %}
+  <div class="ev-label">Observations</div>
+  <ul class="muted">{% for o in p.observations %}<li>{{ o }}</li>{% endfor %}</ul>
+  {% endif %}
+  {% if p.possible_interpretations %}
+  <div class="ev-label">Possible interpretations</div>
+  <ul class="muted">{% for i in p.possible_interpretations %}<li>{{ i }}</li>{% endfor %}</ul>
+  {% endif %}
+  {% if p.limitations %}
+  <div class="ev-label">Limitations</div>
+  <ul class="muted">{% for l in p.limitations %}<li>{{ l }}</li>{% endfor %}</ul>
+  {% endif %}
+  {% if p.standards %}
+  <div class="mono muted">Standards: {{ p.standards|join(', ') }}</div>
+  {% endif %}
+</div>
+{% endfor %}
+{% endif %}
 
 <h2>4 · Scope and limitations</h2>
 <div class="card">

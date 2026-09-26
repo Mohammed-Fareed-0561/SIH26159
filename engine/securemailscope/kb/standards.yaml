@@ -1,0 +1,182 @@
+# Standards knowledge base — maps findings and controls to RFCs.
+#
+# Each entry has:
+#   id:   stable identifier (the finding rule_id or control id)
+#   standards: list of RFC/NIST references
+#   applicability: human-readable note on why the standard applies
+#
+# References are only added where the standard's requirements are directly
+# relevant to the finding or control.  We do NOT invent requirements.
+
+standards:
+  # --- Findings ---
+
+  SMS-AUTH-001:
+    standards: ["RFC 3207", "RFC 8314"]
+    applicability: "RFC 3207 §3 describes STARTTLS; RFC 8314 §3.3 requires encryption before authentication on submission/access."
+
+  SMS-STRIP-001:
+    standards: ["RFC 3207", "RFC 7435"]
+    applicability: "STARTTLS not used — RFC 3207 describes the mechanism; RFC 7435 discusses opportunistic TLS."
+
+  SMS-STRIP-002:
+    standards: ["RFC 3207", "RFC 8314"]
+    applicability: "STARTTLS offered but not used — RFC 3207 §4 describes the negotiation; RFC 8314 §3.3 mandates encryption."
+
+  SMS-STRIP-003:
+    standards: ["RFC 3207", "RFC 9325"]
+    applicability: "STARTTLS requested but TLS not established — RFC 3207 §4 describes the upgrade flow; RFC 9325 §6.9 covers TLS failure handling."
+
+  SMS-STRIP-004:
+    standards: ["RFC 8314", "RFC 5069"]
+    applicability: "Server does not advertise STARTTLS — RFC 8314 §3 requires encryption; RFC 5069 lists known cleartext attack vectors."
+
+  SMS-PROTO-001:
+    standards: ["RFC 8446", "RFC 8996"]
+    applicability: "TLS 1.0/1.1 negotiated — RFC 8996 §2 deprecates TLS 1.0/1.1; RFC 8446 is TLS 1.3."
+
+  SMS-PROTO-002:
+    standards: ["RFC 7525", "RFC 9325"]
+    applicability: "TLS version concerns — RFC 7525 §2.1 recommends TLS 1.2+; RFC 9325 §6.1 consolidates recommendations."
+
+  SMS-PROTO-003:
+    standards: ["RFC 8314"]
+    applicability: "No encryption on a submission/access port — RFC 8314 §3.3 mandates implicit TLS for submission (587) and access (IMAP/POP3)."
+
+  SMS-PROTO-004:
+    standards: ["RFC 7435", "RFC 8314"]
+    applicability: "MTA relay on port 25 with no TLS — RFC 7435 allows opportunistic TLS for MTA-to-MTA; RFC 8314 does not govern relay."
+
+  SMS-AUTH-001:
+    standards: ["RFC 3207", "RFC 8314"]
+    applicability: "Authentication before TLS — RFC 8314 §3.3 requires encryption before authentication."
+
+  SMS-CIPH-001:
+    standards: ["RFC 7525", "RFC 9325"]
+    applicability: "Weak cipher suite — RFC 7525 §3.1..1 lists prohibited algorithms; RFC 9325 §6.2 consolidates cipher guidance."
+
+  SMS-CIPH-002:
+    standards: ["RFC 7525"]
+    applicability: "No forward secrecy — RFC 7525 §3.1.1 requires forward secrecy (PFS)."
+
+  SMS-CIPH-003:
+    standards: ["RFC 8996", "RFC 9325"]
+    applicability: "Deprecated TLS version — RFC 8996 §1.1 deprecates TLS 1.0; RFC 9325 §6.1 covers version policy."
+
+  SMS-CIPH-004:
+    standards: ["RFC 7525"]
+    applicability: "CBC-mode cipher — RFC 7525 §3.1..1 discourages CBC; recommends AEAD."
+
+  SMS-CIPH-005:
+    standards: ["RFC 9325"]
+    applicability: "Weak cipher below modern recommendation level."
+
+  SMS-CIPH-006:
+    standards: ["RFC 8314"]
+    applicability: "Client does not support modern TLS — RFC 8314 §3.1 recommends TLS 1.2+."
+
+  SMS-CERT-001:
+    standards: ["RFC 5280", "RFC 5280:PKIX"]
+    applicability: "Expired certificate — RFC 5280 §6.1.2.5 defines the validity period."
+
+  SMS-CERT-002:
+    standards: ["RFC 5280"]
+    applicability: "Certificate not yet valid — RFC 5280 §6.1.2.5.1 (notBefore)."
+
+  SMS-CERT-003:
+    standards: ["RFC 6125", "RFC 5280"]
+    applicability: "Hostname mismatch — RFC 6125 §6.4.4 defines certificate matching rules."
+
+  SMS-CERT-004:
+    standards: ["RFC 5280", "RFC 5280:4.1.2.7"]
+    applicability: "Self-signed certificate — RFC 5280 §4.1.2.7 on basic constraints."
+
+  SMS-CERT-005:
+    standards: ["RFC 5280", "RFC 5280:4.2.1.9"]
+    applicability: "Incomplete certificate chain — RFC 5280 §4.2.1.9 on certificate policies."
+
+  SMS-CERT-006:
+    standards: ["RFC 5280", "RFC 5280:4.2.1.17"]
+    applicability: "Untrusted root CA — RFC 5280 §4.2.1.17 on name constraints."
+
+  SMS-CERT-007:
+    standards: ["RFC 6125"]
+    applicability: "Certificate weak signature algorithm — RFC 6125 §7.4 on algorithm strength."
+
+  SMS-CERT-008:
+    standards: ["RFC 5280", "RFC 6960"]
+    applicability: "Revoked certificate — RFC 5280 §6.1; OCSP per RFC 6960."
+
+  SMS-KEX-001:
+    standards: ["RFC 8446", "RFC 7525"]
+    applicability: "Weak key exchange — RFC 8446 §4.2.7 on key exchange; RFC 7525 §3.1.1."
+
+  SMS-KEY-001:
+    standards: ["RFC 8446", "RFC 9325"]
+    applicability: "Weak key strength — RFC 8446 §4.2.7; RFC 9325 §7 on key sizes."
+
+  SMS-KEY-002:
+    standards: ["RFC 8446"]
+    applicability: "RSA key exchange without forward secrecy — RFC 8446 §4.2.7."
+
+  SMS-FS-001:
+    standards: ["RFC 7525", "RFC 8446"]
+    applicability: "No forward secrecy — RFC 7525 §3.1.1; RFC 8446 §4.2.7."
+
+  SMS-POL-001:
+    standards: ["RFC 8314", "RFC 7435"]
+    applicability: "MTA-STS or TLS-RPT not deployed — RFC 8461 (MTA-STS) and RFC 8460 (TLS-RPT)."
+
+  SMS-POL-002:
+    standards: ["RFC 8314", "RFC 8461"]
+    applicability: "Opportunistic TLS policy — RFC 8314 §3; MTA-STS per RFC 8461."
+
+  SMS-OK-001:
+    standards: ["RFC 8446", "RFC 9325"]
+    applicability: "Modern secure TLS configuration — RFC 8446 (TLS 1.3) and RFC 9325."
+
+  SMS-VIS-001:
+    standards: ["RFC 8446"]
+    applicability: "TLS 1.3 visibility limitation — RFC 8446 §4.4 encrypts the Certificate message."
+
+  SMS-VIS-002:
+    standards: ["RFC 8446"]
+    applicability: "Cannot observe client certificate from TLS 1.3 capture — RFC 8446 §4.4.2."
+
+  # --- Security Controls ---
+
+  TRANSPORT_ENCRYPTION:
+    standards: ["RFC 8314", "RFC 3207", "RFC 7435"]
+    applicability: "Whether transport encryption is required and used. RFC 8314 §3 mandates encryption; RFC 3207 defines STARTTLS; RFC 7435 covers opportunistic TLS."
+
+  STARTTLS_SECURITY:
+    standards: ["RFC 3207", "RFC 8314"]
+    applicability: "Whether STARTTLS is offered, requested, and successfully negotiated. RFC 3207 §4 describes the negotiation; RFC 8314 §3.3 requires encryption before authentication."
+
+  TLS_VERSION_SECURITY:
+    standards: ["RFC 8996", "RFC 8446", "RFC 7525"]
+    applicability: "Whether the negotiated TLS version is current. RFC 8996 deprecates TLS 1.0/1.1; RFC 8446 defines TLS 1.3; RFC 7525 recommends TLS 1.2+."
+
+  CIPHER_SECURITY:
+    standards: ["RFC 7525", "RFC 9325"]
+    applicability: "Whether the cipher suite provides forward secrecy and modern AEAD. RFC 7525 §3.1.1 lists prohibited algorithms; RFC 9325 §6.2 consolidates cipher guidance."
+
+  KEY_EXCHANGE_SECURITY:
+    standards: ["RFC 8446", "RFC 7525"]
+    applicability: "Whether the key exchange provides forward secrecy. RFC 8446 §4.2.7; RFC 7525 §3.1.1."
+
+  CERTIFICATE_SECURITY:
+    standards: ["RFC 5280", "RFC 6125", "RFC 8460"]
+    applicability: "Certificate validity, chain, hostname, and revocation. RFC 5280 (PKIX); RFC 6125 (hostname verification); RFC 8460 (TLS-RPT)."
+
+  AUTHENTICATION_ORDERING:
+    standards: ["RFC 8314", "RFC 3207"]
+    applicability: "Whether authentication occurs after TLS is established. RFC 8314 §3.3 requires encryption before authentication."
+
+  EMAIL_POLICY_SECURITY:
+    standards: ["RFC 8461", "RFC 8460", "RFC 7672"]
+    applicability: "MTA-STS, TLS-RPT, and DANE policy deployment. RFC 8461 (MTA-STS); RFC 8460 (TLS-RPT); RFC 7672 (S/MIME)."
+
+  SESSION_SECURITY:
+    standards: ["RFC 8446", "RFC 7525"]
+    applicability: "Session resumption, ticket security, and overall TLS posture. RFC 8446 §2.3 (session resumption); RFC 7525 §3.3."

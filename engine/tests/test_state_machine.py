@@ -250,15 +250,17 @@ class TestStateMachineFactory:
         assert result is not None
         assert result.protocol == "smtp"
 
-    def test_imap_returns_none_for_now(self):
+    def test_imap_returns_result(self):
         session = _make_session(protocol=Protocol.IMAP)
         result = build_state_machine_for_session(session)
-        assert result is None  # IMAP not yet implemented
+        assert result is not None  # IMAP now implemented
+        assert result.protocol == "imap"
 
-    def test_pop3_returns_none_for_now(self):
+    def test_pop3_returns_result(self):
         session = _make_session(protocol=Protocol.POP3)
         result = build_state_machine_for_session(session)
-        assert result is None
+        assert result is not None  # POP3 now implemented
+        assert result.protocol == "pop3"
 
 
 # --------------------------------------------------------------------------

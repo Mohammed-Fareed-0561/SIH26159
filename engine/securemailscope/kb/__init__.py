@@ -38,6 +38,8 @@ KB_DIR = os.path.dirname(os.path.abspath(__file__))
 
 RULES_FILE = "rules.yaml"
 CIPHER_SUITES_FILE = "cipher_suites.json"
+STANDARDS_FILE = "standards.yaml"
+
 
 
 def kb_path(name: str) -> str:
@@ -49,3 +51,29 @@ def kb_path(name: str) -> str:
             f"cannot run without it — reinstall with ./scripts/setup.sh."
         )
     return path
+
+
+def load_standards() -> dict[str, dict[str, Any]]:
+    """
+    Load the standards knowledge base (standards.yaml).
+
+    Returns a dict mapping finding/control IDs to their standards metadata:
+    {
+        "SMS-AUTH-001": {
+            "standards": ["RFC 3207", "RFC 8314"],
+            "applicability": "...",
+        },
+        ...
+    }
+    """
+    import yaml
+    from functools import lru_cache
+
+    @lru_cache(maxsize=1)
+    def _load() -> dict[str, dict[str, Any]]:
+        path = kb_path(STANDARDS_FILE)
+        with open(path, "r", encoding="utf-8") as fh:
+            doc = yaml.safe_load(fh)
+        return doc.get("standards", {})
+
+    return _load()

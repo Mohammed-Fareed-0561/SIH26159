@@ -80,6 +80,10 @@ from .scoring.aggregate import build_assets, overall, remediation_plan
 from .scoring.grade import grade_session
 from .scoring.rules import apply_rules
 from .smtp_state_machine import build_state_machine_for_session
+from .finding_linker import link_all_findings
+from .reasoning import ReasoningEngine
+from .security_controls import evaluate_security_controls
+from .cross_session import correlate_sessions
 
 
 def file_sha256(path: str, chunk: int = 1 << 20) -> str:
@@ -349,10 +353,47 @@ def analyse_capture(
 
     # --- Phase 2: email security state machines ------------------------
     email_security_state_machines = []
+    # Build a lookup: session_id -> StateMachineResult
+    sm_results: dict[str, StateMachineResult] = {}
     for s in sessions:
         sm_result = build_state_machine_for_session(s)
         if sm_result is not None:
             email_security_state_machines.append(sm_result)
+            sm_results[s.session_id] = sm_result
+
+    # --- Phase 3: security reasoning ------------------------------------
+    emit("REASONING")
+    engine = ReasoningEngine()
+    all_reasoning: list = []
+    all_finding_refs: list = []
+    all_control_evals: list = []
+
+    for s in sessions:
+        sm_result = sm_results.get(s.session_id)
+        # Link findings to state machine transitions
+        refs = link_all_findings(s, sm_result)
+        s.finding_references = refs
+        all_finding_refs.extend(refs)
+
+        # Run reasoning engine on each finding
+        for finding in s.findings:
+            finding_ref = next(
+                (r for r in refs if r.finding_id == finding.rule_id), None
+            )
+            reasoning = engine.reason(s, sm_result, finding.rule_id, finding, finding_ref)
+            s.reasoning.append(reasoning)
+            all_reasoning.append(reasoning)
+
+        # Evaluate security controls for this session
+        control_evals = evaluate_security_controls(s, sm_result)
+        s.security_controls = control_evals
+        all_control_evals.extend(control_evals)
+
+    # Cross-session correlation
+    cross_session_analyses = correlate_sessions(sessions)
+    all_cross_session_patterns = []
+    for analysis in cross_session_analyses:
+        all_cross_session_patterns.extend(analysis.patterns)
 
     report = Report(
         provenance=provenance(model_path),
@@ -370,6 +411,11 @@ def analyse_capture(
         capture_completeness=capture_completeness,
         evidence=None,
         email_security_state_machines=email_security_state_machines or None,
+        # Phase 3 report fields
+        security_controls=all_control_evals or None,
+        reasoning=all_reasoning or None,
+        cross_session_patterns=all_cross_session_patterns or None,
+        finding_references=all_finding_refs or None,
     )
 
     emit("HISTORY_COMPARISON")

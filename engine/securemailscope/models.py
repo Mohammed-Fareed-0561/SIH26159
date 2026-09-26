@@ -281,6 +281,16 @@ class Session:
 
     coverage: dict[str, Any] = field(default_factory=dict)
 
+    # ---- Phase 3 additions (additive, backward compatible) ----------------
+    # finding_references: link every finding to state-machine transitions + evidence
+    finding_references: list[Any] = field(default_factory=list)  # list[FindingReference]
+    # security_controls: per-session control evaluations
+    security_controls: list[Any] = field(default_factory=list)  # list[ControlEvaluation]
+    # reasoning: the attack-vs-misconfiguration reasoning results
+    reasoning: list[Any] = field(default_factory=list)  # list[ReasoningResult]
+    # cross_session_patterns: patterns observed against other sessions for this asset
+    cross_session_patterns: list[Any] = field(default_factory=list)
+
     # ---- convenience ------------------------------------------------------
     @property
     def encrypted(self) -> bool:
@@ -363,6 +373,12 @@ class Report:
 
     # Phase 2 additions -----------------------------------------------------
     email_security_state_machines: Optional[list] = None
+
+    # Phase 3 additions -----------------------------------------------------
+    security_controls: Optional[list] = None         # list[ControlEvaluation] (per-asset rollup)
+    reasoning: Optional[list] = None                # list[ReasoningResult] (per-finding)
+    cross_session_patterns: Optional[list] = None    # list[PatternResult]
+    finding_references: Optional[list] = None        # list[FindingReference] (capture-level)
 
 
 # --------------------------------------------------------------------------
