@@ -431,6 +431,52 @@ pattern lists confidence and possible interpretations.</p>
 {% endfor %}
 {% endif %}
 
+{# Phase 4: Asset posture history #}
+{% if r.asset_posture_history %}
+<h2>6 · Asset posture history</h2>
+<p class="muted">Posture snapshots and detected drift across multiple captures for each asset.</p>
+{% for ap in r.asset_posture_history %}
+<div class="card">
+  <b>{{ ap.asset_key }}</b>
+  <p>Identity confidence: {{ ap.asset_identity.confidence }} · {{ ap.snapshots|length }} snapshots</p>
+  {% if ap.snapshot_summary %}
+  <div class="ev-label">Summary</div>
+  <p>{{ ap.snapshot_summary }}</p>
+  {% endif %}
+  {% if ap.snapshots %}
+  <div class="ev-label">Snapshots</div>
+  <table class="mono" style="font-size:12px"><thead><tr><th>Capture</th><th>Time</th><th>TLS versions</th><th>Ciphers</th><th>STARTTLS</th><th>Findings</th><th>Confidence</th></tr></thead>
+  <tbody>
+  {% for sn in ap.snapshots %}
+  <tr>
+    <td>{{ sn.capture.capture_id }}</td>
+    <td>{{ sn.capture.capture_time }}</td>
+    <td>{{ sn.tls_versions|dictsort|join(', ') if sn.tls_versions else '—' }}</td>
+    <td>{{ sn.cipher_suites|list|join(', ') if sn.cipher_suites else '—' }}</td>
+    <td>offered {{ sn.starttls_offered_count }} · requested {{ sn.starttls_requested_count }} · accepted {{ sn.starttls_accepted_count }}</td>
+    <td>{{ sn.finding_rule_ids|join(', ') if sn.finding_rule_ids else 'none' }}</td>
+    <td>{{ sn.confidence }}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+  </table>
+  {% endif %}
+  {% if ap.drift_results %}
+  <div class="ev-label">Detected drift</div>
+  {% for dr in ap.drift_results %}
+  <div class="finding {{ 'high' if dr.overall_severity == 'degradation' else 'critical' if dr.overall_severity == 'configuration_change' else 'info' if dr.overall_severity == 'improvement' else 'low' }}">
+    <div class="ft"><span class="pill">{{ dr.overall_severity }}</span> {{ dr.snapshot_before.capture.capture_id }} → {{ dr.snapshot_after.capture.capture_id }}</div>
+    <div class="fd">{{ dr.summary }}</div>
+    {% for c in dr.changes %}
+    <div class="fm">{{ c.property_name }}: {{ c.before_value }} → {{ c.after_value }} (confidence: {{ c.confidence }})</div>
+    {% endfor %}
+  </div>
+  {% endfor %}
+  {% endif %}
+</div>
+{% endfor %}
+{% endif %}
+
 <h2>4 · Scope and limitations</h2>
 <div class="card">
   <ul>

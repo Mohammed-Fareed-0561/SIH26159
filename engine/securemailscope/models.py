@@ -374,11 +374,17 @@ class Report:
     # Phase 2 additions -----------------------------------------------------
     email_security_state_machines: Optional[list] = None
 
-    # Phase 3 additions -----------------------------------------------------
+    # Phase 3 additions ----------------------------------------------------
     security_controls: Optional[list] = None         # list[ControlEvaluation] (per-asset rollup)
     reasoning: Optional[list] = None                # list[ReasoningResult] (per-finding)
     cross_session_patterns: Optional[list] = None    # list[PatternResult]
     finding_references: Optional[list] = None        # list[FindingReference] (capture-level)
+
+    # Phase 4 additions ----------------------------------------------------
+    asset_posture_history: Optional[list] = None     # list[AssetPostureHistory]
+    posture_snapshots: Optional[list] = None         # list[PostureSnapshot]
+    posture_drift: Optional[list] = None             # list[DriftResult]
+    temporal_analysis: Optional[list] = None         # list[TemporalAnalysis]
 
 
 # --------------------------------------------------------------------------
