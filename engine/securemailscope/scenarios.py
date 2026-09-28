@@ -39,6 +39,8 @@ from securemailscope.models import (
     Revocation,
 )
 from securemailscope.evidence import ObservationStatus, Confidence
+from securemailscope.posture import AssetIdentityConfidence
+from securemailscope.remediation import RemediationStatus
 
 
 @dataclass
@@ -109,10 +111,18 @@ def _cert(subject="CN=mail.example", issuer="CN=Example CA",
 
 def _make_session(scenario: GroundTruthScenario, session_id: str = "scn-0",
                   tcp_stream: int = 0,
-                  capture_time: Optional[datetime] = None) -> Session:
-    """Build a Session from a ground-truth scenario."""
+                  capture_time: Optional[datetime] = None,
+                  server_name: Optional[str] = None) -> Session:
+    """Build a Session from a ground-truth scenario.
+
+    ``server_name`` overrides the default ``mail.example`` so that scenarios
+    representing *different* assets can be modelled (e.g. a remediation pair
+    where BEFORE and AFTER target different hosts).
+    """
     if capture_time is None:
-        capture_time = scenario.capture_time or datetime(2024, 1, 1, tzinfo=timezone.utc)
+        capture_time = scenario.capture_time  # may be None — caller decides
+    if server_name is None:
+        server_name = "mail.example"
     return Session(
         session_id=session_id,
         tcp_stream=tcp_stream,
@@ -125,7 +135,7 @@ def _make_session(scenario: GroundTruthScenario, session_id: str = "scn-0",
         protocol=scenario.protocol,
         role=scenario.role,
         tls_mode=scenario.tls_mode,
-        server_name="mail.example",
+        server_name=server_name,
         banner=scenario.banner,
         capability_line=scenario.capability_line,
         starttls_offered=scenario.starttls_offered,
@@ -155,7 +165,9 @@ SCENARIOS = {}
 
 
 def _register(name, **kwargs):
-    SCENARIOS[name] = GroundTruthScenario(name=name, **kwargs)
+    scenario = GroundTruthScenario(name=name, **kwargs)
+    SCENARIOS[name] = scenario
+    return scenario
 
 
 # 1. Secure SMTP STARTTLS + TLS 1.2
@@ -618,4 +630,1029 @@ _register(
     expected_confidence=Confidence.HIGH,
     attack_confirmable=False,
     notes=["Configuration change caused TLS version downgrade — DEGRADATION, not attack"],
+)
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 helpers: pipeline runner and PostureSnapshot builder
+# ---------------------------------------------------------------------------
+def _apply_full_pipeline(session: Session):
+    """Run the full analysis pipeline on a single session.
+
+    This mirrors the test harness in ``test_posture_drift_phase4.py``:
+    rules → grade → state machine → finding links → reasoning → controls.
+
+    Returns ``(sm_result, session)`` so callers can inspect the state machine
+    result if needed.
+    """
+    from securemailscope.scoring.rules import apply_rules
+    from securemailscope.scoring.grade import grade_session
+    from securemailscope.smtp_state_machine import SmtpStateMachine
+    from securemailscope.imap_state_machine import ImapStateMachine
+    from securemailscope.pop3_state_machine import Pop3StateMachine
+    from securemailscope.finding_linker import link_all_findings
+    from securemailscope.reasoning import ReasoningEngine
+    from securemailscope.security_controls import evaluate_security_controls
+
+    session.features = {}
+    session.findings = apply_rules(session)
+    session.grade = grade_session(session, session.findings)
+    sm_result = (
+        SmtpStateMachine(session).build_states()
+        if session.protocol == Protocol.SMTP
+        else (ImapStateMachine(session).build_states()
+              if session.protocol == Protocol.IMAP
+              else Pop3StateMachine(session).build_states())
+    )
+    if sm_result:
+        refs = link_all_findings(session, sm_result)
+        session.finding_references = refs
+        engine = ReasoningEngine()
+        for f in session.findings:
+            ref = next((r for r in refs if r.finding_id == f.rule_id), None)
+            reasoning = engine.reason(session, sm_result, f.rule_id, f, ref)
+            session.reasoning.append(reasoning)
+    controls = evaluate_security_controls(session, sm_result)
+    session.security_controls = controls
+    return sm_result, session
+
+
+def _build_snapshot(
+    scenario: GroundTruthScenario,
+    capture_id: str,
+    server_name: Optional[str] = None,
+    capture_time: Optional[datetime] = None,
+    identity_override_key: Optional[str] = None,
+    identity_override_confidence: Optional[AssetIdentityConfidence] = None,
+):
+    """Build a ``PostureSnapshot`` from a ground-truth scenario.
+
+    *server_name* overrides the default ``mail.example`` so that
+    remediation scenarios targeting different assets are modelled
+    correctly (used by ``different_asset``).
+
+    *identity_override_key* lets a test set a different asset key.
+    When supplied the resulting snapshot's ``asset_identity.key`` and
+    ``host`` are set to this value — used by ``different_asset``.
+
+    *identity_override_confidence* overrides the AssetIdentityConfidence
+    derived from the session — used by ``uncertain_asset_identity``.
+    """
+    # Determine capture time for this snapshot — preserve explicit None so
+    # the missing_timestamps scenario can represent captures without timestamps.
+    if capture_time is not None:
+        cap_time = capture_time
+    elif scenario.capture_time is not None:
+        cap_time = scenario.capture_time
+    else:
+        cap_time = None
+
+    session = _make_session(
+        scenario,
+        server_name=server_name or "mail.example",
+        capture_time=cap_time,
+    )
+    _apply_full_pipeline(session)
+
+    from securemailscope.posture import build_posture_snapshot
+
+    snapshot = build_posture_snapshot([session], capture_id, cap_time)
+
+    # Apply overrides requested by the caller
+    if identity_override_key:
+        snapshot.asset_identity.key = identity_override_key
+        snapshot.asset_identity.host = identity_override_key.split(":")[0]
+    if identity_override_confidence is not None:
+        snapshot.asset_identity.confidence = identity_override_confidence
+
+    return snapshot
+
+
+def _pair_to_snapshots(
+    pair: dict,
+    before_capture_id: str = "capt-before",
+    after_capture_id: str = "capt-after",
+):
+    """Convert a remediation scenario pair dict into two PostureSnapshots.
+
+    Reads identity overrides (after_server_name, before/after identity keys
+    and confidence) directly from the pair dict so callers don't need to
+    pass them separately.
+    """
+    before_scn = pair["before"]
+    after_scn = pair["after"]
+
+    before = _build_snapshot(
+        before_scn,
+        before_capture_id,
+        identity_override_key=pair.get("before_identity_key"),
+        identity_override_confidence=pair.get("before_identity_confidence"),
+    )
+    after = _build_snapshot(
+        after_scn,
+        after_capture_id,
+        server_name=pair.get("after_server_name"),
+        identity_override_key=pair.get("after_identity_key"),
+        identity_override_confidence=pair.get("after_identity_confidence"),
+    )
+    return before, after
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: Remediation verification scenarios
+# ---------------------------------------------------------------------------
+# These are BEFORE/AFTER pairs that test remediation verification logic.
+# Each pair registers two GroundTruthScenario objects (into SCENARIOS) and a
+# summary entry in REMEDIATION_SCENARIOS. The test harness builds PostureSnapshots
+# from the scenarios, runs the full pipeline, and verifies each pair through the
+# real remediation engine (verify_remediation).
+#
+# Each entry maps a stable key to:
+#   before:  GroundTruthScenario
+#   after:   GroundTruthScenario
+#   expected_finding:  the finding rule_id being verified (for finding-level tests)
+#   expected_control:  the control_id being verified (for control-level tests)
+#   expected_status:   RemediationStatus the engine should report
+#   expected_confidence: Confidence the engine should report (approximate)
+#   notes:   human-readable description of the ground-truth expectation
+
+REMEDIATION_SCENARIOS: dict[str, dict] = {}
+
+
+def _pair(name, before, after, expected_status, expected_confidence=Confidence.HIGH,
+          expected_finding=None, expected_control=None, notes=None,
+          after_server_name=None, before_identity_key=None,
+          after_identity_key=None, before_identity_confidence=None,
+          after_identity_confidence=None, **extra):
+    """Register a before/after remediation scenario pair.
+
+    ``before`` and ``after`` are GroundTruthScenario kwargs dicts; they are
+    registered into SCENARIOS under ``{name}__before`` / ``{name}__after`` so
+    the test harness can build PostureSnapshots from them.
+
+    Optional identity overrides for special scenarios:
+      *after_server_name* — different server_name for the AFTER scenario
+      (used by the "different_asset" pair where AFTER targets a different host).
+
+      *before_identity_key / after_identity_key* — explicit asset keys
+      (used by "different_asset" where the two captures target distinct hosts).
+
+      *before_identity_confidence / after_identity_confidence* — override the
+      AssetIdentityConfidence (used by "uncertain_asset_identity").
+    """
+    b = SCENARIOS[f"{name}__before"] = GroundTruthScenario(
+        name=f"{name}__before", **before
+    )
+    a = SCENARIOS[f"{name}__after"] = GroundTruthScenario(
+        name=f"{name}__after", **after
+    )
+    entry = {
+        "before": b,
+        "after": a,
+        "expected_finding": expected_finding,
+        "expected_control": expected_control,
+        "expected_status": expected_status,
+        "expected_confidence": expected_confidence,
+        "notes": notes or [],
+    }
+    # Store optional identity overrides used by _pair_to_snapshots
+    if after_server_name is not None:
+        entry["after_server_name"] = after_server_name
+    if before_identity_key is not None:
+        entry["before_identity_key"] = before_identity_key
+    if after_identity_key is not None:
+        entry["after_identity_key"] = after_identity_key
+    if before_identity_confidence is not None:
+        entry["before_identity_confidence"] = before_identity_confidence
+    if after_identity_confidence is not None:
+        entry["after_identity_confidence"] = after_identity_confidence
+    entry.update(extra)
+    REMEDIATION_SCENARIOS[name] = entry
+
+
+# A. TLS 1.0 → TLS 1.2/1.3  (FIXED)
+_pair(
+    "deprecated_tls_fixed",
+    expected_finding="SMS-PROTO-001",
+    expected_status=RemediationStatus.FIXED,
+    expected_confidence=Confidence.HIGH,
+    notes=["TLS 1.0 replaced by TLS 1.3; finding disappears AND condition observable"],
+    before=dict(
+        description="Before: TLS 1.0 with weak cipher and no forward secrecy",
+        protocol=Protocol.SMTP,
+        role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com",
+        capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS,
+        tls_version="1.0",
+        cipher_suite="AES128-SHA",
+        kex="RSA", forward_secrecy=False,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.OBSERVED,
+        chain=[_cert()], chain_valid=True, name_match=True,
+        capture_time=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        expected_findings=["SMS-PROTO-001", "SMS-CIPH-002", "SMS-FS-001"],
+    ),
+    after=dict(
+        description="After: TLS 1.3 with strong AEAD cipher, ECDHE, forward secrecy",
+        protocol=Protocol.SMTP,
+        role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com",
+        capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS,
+        tls_version="1.3",
+        cipher_suite="TLS_AES_128_GCM_SHA256",
+        kex="ECDHE", forward_secrecy=True,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.ENCRYPTED_TLS13,
+        capture_time=datetime(2024, 2, 1, tzinfo=timezone.utc),
+        expected_findings=[],
+    ),
+)
+
+
+# B. TLS 1.0 still present  (STILL_PRESENT)
+_pair(
+    "deprecated_tls_still_present",
+    expected_finding="SMS-PROTO-001",
+    expected_status=RemediationStatus.STILL_PRESENT,
+    expected_confidence=Confidence.HIGH,
+    notes=["TLS 1.0 still negotiated in the AFTER capture — not remediated"],
+    before=dict(
+        description="Before: TLS 1.0",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS, tls_version="1.0", cipher_suite="AES128-SHA",
+        kex="RSA", forward_secrecy=False,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.OBSERVED,
+        chain=[_cert()], chain_valid=True, name_match=True,
+        capture_time=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        expected_findings=["SMS-PROTO-001"],
+    ),
+    after=dict(
+        description="After: still TLS 1.0 (no remediation)",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS, tls_version="1.0", cipher_suite="AES128-SHA",
+        kex="RSA", forward_secrecy=False,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.OBSERVED,
+        chain=[_cert()], chain_valid=True, name_match=True,
+        capture_time=datetime(2024, 2, 1, tzinfo=timezone.utc),
+        expected_findings=["SMS-PROTO-001"],
+    ),
+)
+
+
+# C. TLS 1.0 + weak cipher → only TLS fixed, cipher remains  (PARTIALLY_FIXED)
+_pair(
+    "deprecated_tls_partial_fix_only_tls",
+    expected_finding="SMS-CIPH-002",
+    expected_status=RemediationStatus.PARTIALLY_FIXED,
+    expected_confidence=Confidence.HIGH,
+    notes=["TLS upgraded but weak cipher (no Forward Secrecy) remains — partial remediation"],
+    before=dict(
+        description="Before: TLS 1.0 + RSA key exchange (no PFS)",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS, tls_version="1.0", cipher_suite="AES128-SHA",
+        kex="RSA", forward_secrecy=False,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.OBSERVED,
+        chain=[_cert()], chain_valid=True, name_match=True,
+        capture_time=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        expected_findings=["SMS-PROTO-001", "SMS-CIPH-002", "SMS-FS-001"],
+    ),
+    after=dict(
+        description="After: TLS 1.2 but still RSA (no forward secrecy)",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS, tls_version="1.2", cipher_suite="AES128-SHA",
+        kex="RSA", forward_secrecy=False,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.OBSERVED,
+        chain=[_cert()], chain_valid=True, name_match=True,
+        capture_time=datetime(2024, 2, 1, tzinfo=timezone.utc),
+        expected_findings=["SMS-CIPH-002", "SMS-FS-001"],
+    ),
+)
+
+
+# D. Missing TLS handshake after remediation  (UNVERIFIABLE)
+_pair(
+    "deprecated_tls_missing_handshake",
+    expected_finding="SMS-PROTO-001",
+    expected_status=RemediationStatus.UNVERIFIABLE,
+    expected_confidence=Confidence.MEDIUM,
+    notes=["Finding absent from AFTER but no TLS handshake observable — UNVERIFIABLE"],
+    before=dict(
+        description="Before: TLS 1.0 observed",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS, tls_version="1.0", cipher_suite="AES128-SHA",
+        kex="RSA", forward_secrecy=False,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.OBSERVED,
+        chain=[_cert()], chain_valid=True, name_match=True,
+        capture_time=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        expected_findings=["SMS-PROTO-001"],
+    ),
+    after=dict(
+        description="After: STARTTLS offered but handshake incomplete — TLS not observable",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=False,
+        tls_mode=TlsMode.CLEARTEXT,
+        command_transcript=["EHLO", "STARTTLS"],
+        cert_visibility=CertVisibility.ABSENT,
+        first_frame=0, last_frame=8,
+        capture_time=datetime(2024, 2, 1, tzinfo=timezone.utc),
+        expected_findings=[],
+    ),
+)
+
+
+# E. AUTH-before-TLS → AUTH-after-TLS  (FIXED)
+_pair(
+    "auth_before_tls_fixed",
+    expected_finding="SMS-AUTH-001",
+    expected_status=RemediationStatus.FIXED,
+    expected_confidence=Confidence.HIGH,
+    notes=["Cleartext AUTH replaced by AUTH-after-TLS; finding gone and AUTH observable"],
+    before=dict(
+        description="Before: AUTH PLAIN in cleartext",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=False, starttls_accepted=False,
+        tls_mode=TlsMode.CLEARTEXT,
+        cleartext_auth=AuthExposure(mechanism="PLAIN", username="user",
+                                    secret_sha256="abc", frame=10),
+        command_transcript=["EHLO", "AUTH PLAIN"],
+        capture_time=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        expected_findings=["SMS-AUTH-001", "SMS-STRIP-002"],
+    ),
+    after=dict(
+        description="After: STARTTLS then AUTH after TLS",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS, tls_version="1.2",
+        cipher_suite="ECDHE-RSA-AES128-GCM-SHA256",
+        kex="ECDHE", forward_secrecy=True,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.OBSERVED,
+        chain=[_cert()], chain_valid=True, name_match=True,
+        capture_time=datetime(2024, 2, 1, tzinfo=timezone.utc),
+        expected_findings=[],
+    ),
+)
+
+
+# F. AUTH-before-TLS remains  (STILL_PRESENT)
+_pair(
+    "auth_before_tls_still_present",
+    expected_finding="SMS-AUTH-001",
+    expected_status=RemediationStatus.STILL_PRESENT,
+    expected_confidence=Confidence.HIGH,
+    notes=["Cleartext AUTH still present in AFTER — not remediated"],
+    before=dict(
+        description="Before: AUTH before TLS",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=False, starttls_accepted=False,
+        tls_mode=TlsMode.CLEARTEXT,
+        cleartext_auth=AuthExposure(mechanism="PLAIN", username="user",
+                                    secret_sha256="abc", frame=10),
+        command_transcript=["EHLO", "AUTH PLAIN"],
+        capture_time=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        expected_findings=["SMS-AUTH-001"],
+    ),
+    after=dict(
+        description="After: still AUTH before TLS",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=False, starttls_accepted=False,
+        tls_mode=TlsMode.CLEARTEXT,
+        cleartext_auth=AuthExposure(mechanism="PLAIN", username="user",
+                                    secret_sha256="abc", frame=10),
+        command_transcript=["EHLO", "AUTH PLAIN"],
+        capture_time=datetime(2024, 2, 1, tzinfo=timezone.utc),
+        expected_findings=["SMS-AUTH-001"],
+    ),
+)
+
+
+# G. Expired certificate → valid certificate  (FIXED)
+_pair(
+    "cert_expired_fixed",
+    expected_finding="SMS-CERT-001",
+    expected_status=RemediationStatus.FIXED,
+    expected_confidence=Confidence.HIGH,
+    notes=["Expired cert replaced with valid cert; cert observable in AFTER"],
+    before=dict(
+        description="Before: expired certificate",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS, tls_version="1.2",
+        cipher_suite="ECDHE-RSA-AES128-GCM-SHA256", kex="ECDHE", forward_secrecy=True,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.OBSERVED,
+        chain=[_cert(not_before=datetime(2020, 1, 1, tzinfo=timezone.utc),
+                      not_after=datetime(2023, 6, 1, tzinfo=timezone.utc),
+                      expired_at_capture=True)],
+        chain_valid=False, name_match=True,
+        capture_time=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        expected_findings=["SMS-CERT-001"],
+    ),
+    after=dict(
+        description="After: valid certificate",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS, tls_version="1.2",
+        cipher_suite="ECDHE-RSA-AES128-GCM-SHA256", kex="ECDHE", forward_secrecy=True,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.OBSERVED,
+        chain=[_cert(not_before=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                      not_after=datetime(2026, 1, 1, tzinfo=timezone.utc))],
+        chain_valid=True, name_match=True,
+        capture_time=datetime(2024, 2, 1, tzinfo=timezone.utc),
+        expected_findings=[],
+    ),
+)
+
+
+# H. Certificate not observable after remediation  (UNVERIFIABLE)
+_pair(
+    "cert_not_observable_after",
+    expected_finding="SMS-CERT-001",
+    expected_status=RemediationStatus.UNVERIFIABLE,
+    expected_confidence=Confidence.MEDIUM,
+    notes=["Expired cert finding gone, but AFTER uses TLS 1.3 so cert not observable — UNVERIFIABLE"],
+    before=dict(
+        description="Before: expired cert with TLS 1.2 (cert visible)",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS, tls_version="1.2",
+        cipher_suite="ECDHE-RSA-AES128-GCM-SHA256", kex="ECDHE", forward_secrecy=True,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.OBSERVED,
+        chain=[_cert(not_before=datetime(2020, 1, 1, tzinfo=timezone.utc),
+                      not_after=datetime(2023, 6, 1, tzinfo=timezone.utc),
+                      expired_at_capture=True)],
+        chain_valid=False, name_match=True,
+        capture_time=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        expected_findings=["SMS-CERT-001"],
+    ),
+    after=dict(
+        description="After: TLS 1.3 — certificate encrypted, not observable",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS, tls_version="1.3",
+        cipher_suite="TLS_AES_128_GCM_SHA256", kex="ECDHE", forward_secrecy=True,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.ENCRYPTED_TLS13,
+        capture_time=datetime(2024, 2, 1, tzinfo=timezone.utc),
+        expected_findings=[],
+    ),
+)
+
+
+# I. STARTTLS not used → STARTTLS negotiated  (FIXED)
+_pair(
+    "starttls_fixed",
+    expected_finding="SMS-STRIP-002",
+    expected_status=RemediationStatus.FIXED,
+    expected_confidence=Confidence.HIGH,
+    notes=["STARTTLS now negotiated; finding gone and STARTTLS handshake observable"],
+    before=dict(
+        description="Before: STARTTLS offered but not used, cleartext auth",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=False, starttls_accepted=False,
+        tls_mode=TlsMode.CLEARTEXT,
+        cleartext_auth=AuthExposure(mechanism="PLAIN", username="user",
+                                    secret_sha256="abc", frame=10),
+        command_transcript=["EHLO", "AUTH PLAIN"],
+        capture_time=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        expected_findings=["SMS-STRIP-002"],
+    ),
+    after=dict(
+        description="After: STARTTLS negotiated successfully",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS, tls_version="1.2",
+        cipher_suite="ECDHE-RSA-AES128-GCM-SHA256", kex="ECDHE", forward_secrecy=True,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.OBSERVED,
+        chain=[_cert()], chain_valid=True, name_match=True,
+        capture_time=datetime(2024, 2, 1, tzinfo=timezone.utc),
+        expected_findings=[],
+    ),
+)
+
+
+# J. STARTTLS still not used  (STILL_PRESENT)
+_pair(
+    "starttls_still_present",
+    expected_finding="SMS-STRIP-002",
+    expected_status=RemediationStatus.STILL_PRESENT,
+    expected_confidence=Confidence.HIGH,
+    notes=["STARTTLS still not used in AFTER — not remediated"],
+    before=dict(
+        description="Before: STARTTLS offered but not used",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=False, starttls_accepted=False,
+        tls_mode=TlsMode.CLEARTEXT,
+        command_transcript=["EHLO", "MAIL FROM"],
+        capture_time=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        expected_findings=["SMS-STRIP-002"],
+    ),
+    after=dict(
+        description="After: still STARTTLS offered but not used",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=False, starttls_accepted=False,
+        tls_mode=TlsMode.CLEARTEXT,
+        command_transcript=["EHLO", "MAIL FROM"],
+        capture_time=datetime(2024, 2, 1, tzinfo=timezone.utc),
+        expected_findings=["SMS-STRIP-002"],
+    ),
+)
+
+
+# K. Weak cipher fixed  (FIXED)
+_pair(
+    "weak_cipher_fixed",
+    expected_finding="SMS-CIPH-001",
+    expected_status=RemediationStatus.FIXED,
+    expected_confidence=Confidence.HIGH,
+    notes=["RC4-SHA (broken) replaced by TLS_AES_128_GCM_SHA256; cipher observable in AFTER"],
+    before=dict(
+        description="Before: broken RC4 cipher suite",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS, tls_version="1.2",
+        cipher_suite="RC4-SHA", kex="RSA", forward_secrecy=False,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.OBSERVED,
+        chain=[_cert()], chain_valid=True, name_match=True,
+        capture_time=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        expected_findings=["SMS-CIPH-001", "SMS-CIPH-002", "SMS-FS-001"],
+    ),
+    after=dict(
+        description="After: modern AEAD cipher with forward secrecy",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS, tls_version="1.2",
+        cipher_suite="ECDHE-RSA-AES128-GCM-SHA256", kex="ECDHE", forward_secrecy=True,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.OBSERVED,
+        chain=[_cert()], chain_valid=True, name_match=True,
+        capture_time=datetime(2024, 2, 1, tzinfo=timezone.utc),
+        expected_findings=[],
+    ),
+)
+
+
+# L. Weak cipher still present  (STILL_PRESENT)
+_pair(
+    "weak_cipher_still_present",
+    expected_finding="SMS-CIPH-001",
+    expected_status=RemediationStatus.STILL_PRESENT,
+    expected_confidence=Confidence.HIGH,
+    notes=["Broken cipher (RC4) still negotiated in AFTER — not remediated"],
+    before=dict(
+        description="Before: broken RC4 cipher",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS, tls_version="1.2",
+        cipher_suite="RC4-SHA", kex="RSA", forward_secrecy=False,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.OBSERVED,
+        chain=[_cert()], chain_valid=True, name_match=True,
+        capture_time=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        expected_findings=["SMS-CIPH-001"],
+    ),
+    after=dict(
+        description="After: still using RC4",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS, tls_version="1.2",
+        cipher_suite="RC4-SHA", kex="RSA", forward_secrecy=False,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.OBSERVED,
+        chain=[_cert()], chain_valid=True, name_match=True,
+        capture_time=datetime(2024, 2, 1, tzinfo=timezone.utc),
+        expected_findings=["SMS-CIPH-001"],
+    ),
+)
+
+
+# M. Multiple findings partially fixed  (PARTIALLY_FIXED)
+_pair(
+    "multiple_findings_partially_fixed",
+    expected_finding=None,
+    expected_status=RemediationStatus.PARTIALLY_FIXED,
+    expected_confidence=Confidence.HIGH,
+    notes=["Some findings fixed (TLS), others remain (no forward secrecy)"],
+    before=dict(
+        description="Before: TLS 1.0 + no forward secrecy + weak cipher",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS, tls_version="1.0",
+        cipher_suite="AES128-SHA", kex="RSA", forward_secrecy=False,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.OBSERVED,
+        chain=[_cert()], chain_valid=True, name_match=True,
+        capture_time=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        expected_findings=["SMS-PROTO-001", "SMS-CIPH-002", "SMS-FS-001"],
+    ),
+    after=dict(
+        description="After: TLS 1.2 but still RSA (no forward secrecy)",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS, tls_version="1.2",
+        cipher_suite="ECDHE-RSA-AES128-GCM-SHA256", kex="RSA", forward_secrecy=False,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.OBSERVED,
+        chain=[_cert()], chain_valid=True, name_match=True,
+        capture_time=datetime(2024, 2, 1, tzinfo=timezone.utc),
+        expected_findings=["SMS-FS-001"],
+    ),
+)
+
+
+# N. Incomplete AFTER capture  (UNVERIFIABLE)
+_pair(
+    "incomplete_after_capture",
+    expected_finding="SMS-PROTO-001",
+    expected_status=RemediationStatus.UNVERIFIABLE,
+    expected_confidence=Confidence.MEDIUM,
+    notes=["AFTER capture ends mid-handshake; condition not observable → UNVERIFIABLE"],
+    before=dict(
+        description="Before: TLS 1.0 fully captured",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS, tls_version="1.0", cipher_suite="AES128-SHA",
+        kex="RSA", forward_secrecy=False,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.OBSERVED,
+        chain=[_cert()], chain_valid=True, name_match=True,
+        capture_time=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        expected_findings=["SMS-PROTO-001"],
+    ),
+    after=dict(
+        description="After: STARTTLS requested but handshake incomplete (truncated capture)",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=False,
+        tls_mode=TlsMode.CLEARTEXT,
+        command_transcript=["EHLO", "STARTTLS"],
+        cert_visibility=CertVisibility.ABSENT,
+        first_frame=0, last_frame=5,
+        capture_time=datetime(2024, 2, 1, tzinfo=timezone.utc),
+        expected_findings=[],
+    ),
+)
+
+
+# O. Different asset  (UNVERIFIABLE)
+_pair(
+    "different_asset",
+    expected_finding="SMS-PROTO-001",
+    expected_status=RemediationStatus.UNVERIFIABLE,
+    expected_confidence=Confidence.LOW,
+    notes=["BEFORE and AFTER target different server identities — cannot pair"],
+    before=dict(
+        description="Before: TLS 1.0 on mail.example",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS, tls_version="1.0", cipher_suite="AES128-SHA",
+        kex="RSA", forward_secrecy=False,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.OBSERVED,
+        chain=[_cert()], chain_valid=True, name_match=True,
+        capture_time=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        expected_findings=["SMS-PROTO-001"],
+    ),
+    after=dict(
+        description="After: TLS 1.3 on other.example (different asset)",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 other.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS, tls_version="1.3",
+        cipher_suite="TLS_AES_128_GCM_SHA256", kex="ECDHE", forward_secrecy=True,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.OBSERVED,
+        chain=[_cert()], chain_valid=True, name_match=True,
+        capture_time=datetime(2024, 2, 1, tzinfo=timezone.utc),
+        expected_findings=[],
+    ),
+    after_server_name="other.example",
+    after_identity_key="other.example:587",
+)
+
+
+# P. Missing timestamps  (UNVERIFIABLE — pair supplied explicitly but chronological order unverifiable)
+_pair(
+    "missing_timestamps",
+    expected_finding="SMS-PROTO-001",
+    expected_status=RemediationStatus.UNVERIFIABLE,
+    expected_confidence=Confidence.MEDIUM,
+    notes=["BEFORE/AFTER pair supplied but timestamps missing; temporal ordering NOT_OBSERVABLE"],
+    before=dict(
+        description="Before: TLS 1.0 (no timestamp)",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS, tls_version="1.0", cipher_suite="AES128-SHA",
+        kex="RSA", forward_secrecy=False,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.OBSERVED,
+        chain=[_cert()], chain_valid=True, name_match=True,
+        capture_time=None,
+        expected_findings=["SMS-PROTO-001"],
+    ),
+    after=dict(
+        description="After: TLS 1.3 (no timestamp)",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS, tls_version="1.3",
+        cipher_suite="TLS_AES_128_GCM_SHA256", kex="ECDHE", forward_secrecy=True,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.ENCRYPTED_TLS13,
+        capture_time=None,
+        expected_findings=[],
+    ),
+)
+
+
+# Q. Regression: TLS 1.0 reappears in a later capture  (STILL_PRESENT)
+_pair(
+    "regression_tls_returns",
+    expected_finding="SMS-PROTO-001",
+    expected_status=RemediationStatus.STILL_PRESENT,
+    expected_confidence=Confidence.HIGH,
+    notes=["Regression: TLS 1.0 was remediated but reappeared in AFTER"],
+    before=dict(
+        description="Before: TLS 1.3 (remediated from prior TLS 1.0)",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS, tls_version="1.3",
+        cipher_suite="TLS_AES_128_GCM_SHA256", kex="ECDHE", forward_secrecy=True,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.ENCRYPTED_TLS13,
+        capture_time=datetime(2024, 2, 1, tzinfo=timezone.utc),
+        expected_findings=[],
+    ),
+    after=dict(
+        description="After: TLS 1.0 reappeared (regression)",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS, tls_version="1.0", cipher_suite="AES128-SHA",
+        kex="RSA", forward_secrecy=False,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.OBSERVED,
+        chain=[_cert()], chain_valid=True, name_match=True,
+        capture_time=datetime(2024, 3, 1, tzinfo=timezone.utc),
+        expected_findings=["SMS-PROTO-001", "SMS-CIPH-002", "SMS-FS-001"],
+    ),
+)
+
+
+# R. Control FAIL → PASS  (FIXED)
+_pair(
+    "control_fail_to_pass",
+    expected_finding="SMS-PROTO-001",
+    expected_control="TLS_VERSION_SECURITY",
+    expected_status=RemediationStatus.FIXED,
+    expected_confidence=Confidence.HIGH,
+    notes=["Control TLS_VERSION_SECURITY: FAIL → PASS"],
+    before=dict(
+        description="Before: TLS 1.0 — control FAIL",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS, tls_version="1.0", cipher_suite="AES128-SHA",
+        kex="RSA", forward_secrecy=False,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.OBSERVED,
+        chain=[_cert()], chain_valid=True, name_match=True,
+        capture_time=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        expected_findings=["SMS-PROTO-001", "SMS-CIPH-002", "SMS-FS-001"],
+    ),
+    after=dict(
+        description="After: TLS 1.3 — control PASS",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS, tls_version="1.3",
+        cipher_suite="TLS_AES_128_GCM_SHA256", kex="ECDHE", forward_secrecy=True,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.ENCRYPTED_TLS13,
+        capture_time=datetime(2024, 2, 1, tzinfo=timezone.utc),
+        expected_findings=[],
+    ),
+)
+
+
+# S. Control FAIL → WARN  (PARTIALLY_FIXED)
+_pair(
+    "control_fail_to_warn",
+    expected_finding="SMS-AUTH-001",
+    expected_control="AUTHENTICATION_ORDERING",
+    expected_status=RemediationStatus.PARTIALLY_FIXED,
+    expected_confidence=Confidence.HIGH,
+    notes=["Control AUTHENTICATION_ORDERING: FAIL → WARN (auth now after STARTTLS offered but still cleartext session)"],
+    before=dict(
+        description="Before: AUTH before TLS — control FAIL",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=False, starttls_accepted=False,
+        tls_mode=TlsMode.CLEARTEXT,
+        cleartext_auth=AuthExposure(mechanism="PLAIN", username="user",
+                                    secret_sha256="abc", frame=10),
+        command_transcript=["EHLO", "AUTH PLAIN"],
+        capture_time=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        expected_findings=["SMS-AUTH-001", "SMS-STRIP-002"],
+    ),
+    after=dict(
+        description="After: STARTTLS negotiated but AUTH-before-TLS still present — control WARN",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS, tls_version="1.2",
+        cipher_suite="ECDHE-RSA-AES128-GCM-SHA256", kex="ECDHE", forward_secrecy=True,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.OBSERVED,
+        chain=[_cert()], chain_valid=True, name_match=True,
+        capture_time=datetime(2024, 2, 1, tzinfo=timezone.utc),
+        # AUTH before TLS finding still present in this synthetic case
+        expected_findings=["SMS-AUTH-001"],
+    ),
+)
+
+
+# T. Control FAIL → FAIL  (STILL_PRESENT)
+_pair(
+    "control_fail_to_fail",
+    expected_finding="SMS-CIPH-001",
+    expected_control="CIPHER_SECURITY",
+    expected_status=RemediationStatus.STILL_PRESENT,
+    expected_confidence=Confidence.HIGH,
+    notes=["Control CIPHER_SECURITY: FAIL → FAIL"],
+    before=dict(
+        description="Before: broken RC4 cipher — control FAIL",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS, tls_version="1.2",
+        cipher_suite="RC4-SHA", kex="RSA", forward_secrecy=False,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.OBSERVED,
+        chain=[_cert()], chain_valid=True, name_match=True,
+        capture_time=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        expected_findings=["SMS-CIPH-001"],
+    ),
+    after=dict(
+        description="After: still RC4 — control FAIL",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS, tls_version="1.2",
+        cipher_suite="RC4-SHA", kex="RSA", forward_secrecy=False,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.OBSERVED,
+        chain=[_cert()], chain_valid=True, name_match=True,
+        capture_time=datetime(2024, 2, 1, tzinfo=timezone.utc),
+        expected_findings=["SMS-CIPH-001"],
+    ),
+)
+
+
+# U. Relevant protocol missing  (UNVERIFIABLE)
+_pair(
+    "relevant_protocol_missing",
+    expected_finding="SMS-PROTO-001",
+    expected_status=RemediationStatus.UNVERIFIABLE,
+    expected_confidence=Confidence.MEDIUM,
+    notes=["BEFORE has cleartext SMTP only; no TLS protocol was ever observed in either capture"],
+    before=dict(
+        description="Before: cleartext SMTP, no STARTTLS advertised",
+        protocol=Protocol.SMTP, role=Role.MTA_RELAY,
+        banner="220 mail.example.com", capability_line="250-AUTH PLAIN LOGIN",
+        starttls_offered=False, starttls_requested=False, starttls_accepted=False,
+        tls_mode=TlsMode.CLEARTEXT,
+        command_transcript=["EHLO", "MAIL FROM"],
+        capture_time=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        expected_findings=["SMS-STRIP-004"],
+    ),
+    after=dict(
+        description="After: cleartext SMTP, still no STARTTLS",
+        protocol=Protocol.SMTP, role=Role.MTA_RELAY,
+        banner="220 mail.example.com", capability_line="250-AUTH PLAIN LOGIN",
+        starttls_offered=False, starttls_requested=False, starttls_accepted=False,
+        tls_mode=TlsMode.CLEARTEXT,
+        command_transcript=["EHLO", "MAIL FROM"],
+        capture_time=datetime(2024, 2, 1, tzinfo=timezone.utc),
+        expected_findings=["SMS-STRIP-004"],
+    ),
+)
+
+
+# V. Contradictory observations  (UNVERIFIABLE)
+_pair(
+    "contradictory_observations",
+    expected_finding="SMS-PROTO-001",
+    expected_status=RemediationStatus.UNVERIFIABLE,
+    expected_confidence=Confidence.LOW,
+    notes=["BEFORE says TLS 1.0 removed but TLS 1.0 still listed in tls_versions — contradictory evidence"],
+    before=dict(
+        description="Before: contradictory — finding absent but TLS 1.0 in versions",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS, tls_version="1.0", cipher_suite="AES128-SHA",
+        kex="RSA", forward_secrecy=False,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.OBSERVED,
+        chain=[_cert()], chain_valid=True, name_match=True,
+        capture_time=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        # expected_findings omits SMS-PROTO-001 to create contradiction
+        expected_findings=[],
+    ),
+    after=dict(
+        description="After: TLS 1.3",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS, tls_version="1.3",
+        cipher_suite="TLS_AES_128_GCM_SHA256", kex="ECDHE", forward_secrecy=True,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.ENCRYPTED_TLS13,
+        capture_time=datetime(2024, 2, 1, tzinfo=timezone.utc),
+        expected_findings=[],
+    ),
+)
+
+
+# W. Uncertain asset identity  (UNVERIFIABLE)
+_pair(
+    "uncertain_asset_identity",
+    expected_finding="SMS-PROTO-001",
+    expected_status=RemediationStatus.UNVERIFIABLE,
+    expected_confidence=Confidence.LOW,
+    notes=["Asset identity confidence UNCERTAIN — cannot safely pair BEFORE/AFTER"],
+    before=dict(
+        description="Before: TLS 1.0 on an IP-only host (uncertain identity)",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS, tls_version="1.0", cipher_suite="AES128-SHA",
+        kex="RSA", forward_secrecy=False,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.OBSERVED,
+        chain=[_cert()], chain_valid=True, name_match=True,
+        capture_time=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        expected_findings=["SMS-PROTO-001"],
+    ),
+    after=dict(
+        description="After: TLS 1.3 on an IP-only host (uncertain identity)",
+        protocol=Protocol.SMTP, role=Role.SUBMISSION_ACCESS,
+        banner="220 mail.example.com", capability_line="250-STARTTLS",
+        starttls_offered=True, starttls_requested=True, starttls_accepted=True,
+        tls_mode=TlsMode.STARTTLS, tls_version="1.3",
+        cipher_suite="TLS_AES_128_GCM_SHA256", kex="ECDHE", forward_secrecy=True,
+        command_transcript=["EHLO", "STARTTLS", "EHLO", "AUTH PLAIN"],
+        cert_visibility=CertVisibility.ENCRYPTED_TLS13,
+        capture_time=datetime(2024, 2, 1, tzinfo=timezone.utc),
+        expected_findings=[],
+    ),
+    before_identity_confidence=AssetIdentityConfidence.UNCERTAIN,
+    after_identity_confidence=AssetIdentityConfidence.UNCERTAIN,
 )

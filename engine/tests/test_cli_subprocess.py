@@ -43,6 +43,8 @@ def run_cli(*args: str) -> subprocess.CompletedProcess:
         env=env,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=180,
     )
 
@@ -180,7 +182,7 @@ def test_render_reads_the_report_from_stdin(captures, tmp_path):
     piped = subprocess.run(
         [sys.executable, "-m", "securemailscope.cli", "render", "-", "--html", "-"],
         cwd=ENGINE_ROOT, env=env, input=analysed.stdout,
-        capture_output=True, text=True, timeout=180,
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180,
     )
     assert piped.returncode == 0, piped.stderr[-2000:]
     assert piped.stdout.lstrip().startswith("<!DOCTYPE html>")
